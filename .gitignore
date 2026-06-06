@@ -1,0 +1,51 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.*
+
+# Local database and runtime files
+*.db
+*.sqlite3
+mindcheck_local.db
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Python packaging
+*.egg-info/
+pip-wheel-metadata/
+*.egg
+
+# Logs
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+__pypackages__/
+
+# Node/npm (if present)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
