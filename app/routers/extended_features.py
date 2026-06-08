@@ -477,7 +477,7 @@ async def export_excel(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
-    """Exporta reportes de screening en formato compatible con Excel (CSV UTF-8 con BOM)."""
+    """Exporta reportes de screening en formato Excel (.xlsx)."""
     # Query matching data
     query = db.query(Evaluacion).join(Resultado).join(Estudiante)
     if start_date:
@@ -494,22 +494,30 @@ async def export_excel(
         score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == ev.id_evaluacion).scalar() or 0
         rows.append({
             "id_anonimo": f"#{ev.id_estudiante.hex[:6].upper()}",
-            "fecha": ev.fecha_evaluacion,
+            "fecha": ev.fecha_evaluacion.strftime("%Y-%m-%d %H:%M:%S") if ev.fecha_evaluacion else "",
             "nivel_riesgo": ev.resultado.nivel_riesgo.replace("_", " ").capitalize(),
             "puntaje": int(score),
-            "alerta_suicidio": ev.resultado.alerta_suicidio,
+            "alerta_suicidio": "SÍ" if ev.resultado.alerta_suicidio else "NO",
             "carrera": ev.estudiante.carrera,
             "universidad": ev.estudiante.universidad
         })
         
-    csv_str = generate_csv_data(rows)
-    # Add BOM for direct Excel click compatibility (UTF-8 encoding wrapper)
-    excel_compatible_bytes = b"\xef\xbb\xbf" + csv_str.encode("utf-8")
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["ID Anónimo", "Fecha", "Nivel de Riesgo", "Puntaje PHQ-9", "Alerta Suicidio", "Carrera", "Universidad"])
+    else:
+        df.columns = ["ID Anónimo", "Fecha", "Nivel de Riesgo", "Puntaje PHQ-9", "Alerta Suicidio", "Carrera", "Universidad"]
+        
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Reporte MindCheck")
+    excel_buffer.seek(0)
     
     return StreamingResponse(
-        io.BytesIO(excel_compatible_bytes),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=reporte_mindcheck.csv"}
+        excel_buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=reporte_mindcheck.xlsx"}
     )
 
 
