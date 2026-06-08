@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     DEBUG: bool = os.getenv("DEBUG", "True").lower() == "true"
     CORS_ORIGINS: str = os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+        "http://localhost:5173,http://127.0.0.1:5173,https://frontend-depresion.vercel.app",
     )
 
     SUPABASE_PROJECT_REF: str = os.getenv("SUPABASE_PROJECT_REF", "")

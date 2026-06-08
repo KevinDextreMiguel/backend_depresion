@@ -4,7 +4,7 @@ from sqlalchemy import func
 from ..database import get_db
 from ..models import Usuario, Administrador, Psicologo, Estudiante, AuditoriaAcceso
 from ..schemas import UserCreate, UserResponse, StudentSignup, AuthTokenResponse, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdateProfile
-from ..security import get_supabase_client, get_current_user
+from ..security import get_supabase_client, get_supabase_anon_client, get_current_user
 import uuid
 import traceback
 
@@ -14,7 +14,10 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 @router.post("/login", response_model=AuthTokenResponse)
 async def login(credentials: UserLogin, db: Session = Depends(get_db)):
     """Inicio de sesión con Supabase Auth."""
-    supabase_client = get_supabase_client()
+    # Use anon client for sign_in_with_password (requires publishable/anon key)
+    anon_client = get_supabase_anon_client()
+    service_client = get_supabase_client()
+    supabase_client = anon_client or service_client
     if not supabase_client:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -56,7 +59,7 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[Auth Login Error] Details: {e}", flush=True)
         err_msg = str(e).lower()
-        if "invalid login credentials" in err_msg:
+        if "invalid login credentials" in err_msg or "invalid password" in err_msg:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Correo o contraseña incorrectos."
@@ -140,23 +143,28 @@ async def reset_password(request: ResetPasswordRequest):
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
 async def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
-    """Registro usando únicamente Supabase Auth."""
-    supabase_client = get_supabase_client()
-    if not supabase_client:
+    """Registro usando Supabase Auth (sign_up + confirm + perfil local)."""
+    anon_client = get_supabase_anon_client()
+    service_client = get_supabase_client()
+    if not anon_client and not service_client:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Servicio de Supabase no configurado."
         )
 
+    supabase_uid = None
     try:
-        auth_response = supabase_client.auth.admin.create_user({
+        # 1. Registrar en Supabase Auth usando sign_up (funciona con anon key)
+        client_for_signup = anon_client or service_client
+        auth_response = client_for_signup.auth.sign_up({
             "email": user_in.email,
             "password": user_in.password,
-            "user_metadata": {
-                "name": user_in.nombre,
-                "role": user_in.rol
-            },
-            "email_confirm": True
+            "options": {
+                "data": {
+                    "name": user_in.nombre,
+                    "role": user_in.rol
+                }
+            }
         })
         
         if not auth_response or not auth_response.user:
@@ -166,13 +174,24 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
             )
             
         supabase_uid = uuid.UUID(auth_response.user.id)
+
+        # 2. Confirmar email automáticamente si tenemos service client
+        if service_client:
+            try:
+                service_client.auth.admin.update_user_by_id(
+                    str(supabase_uid),
+                    {"email_confirm": True}
+                )
+            except Exception as confirm_err:
+                print(f"[Auth Signup] Email confirm warn: {confirm_err}", flush=True)
+
     except HTTPException as e:
         raise e
     except Exception as e:
         print(f"[Auth Signup Admin Error] Exception: {e}", flush=True)
         print(f"[Auth Signup Admin Error] Traceback:\n{traceback.format_exc()}", flush=True)
         err_msg = str(e).lower()
-        if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
+        if "already" in err_msg or "exists" in err_msg or "in use" in err_msg or "registered" in err_msg:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El correo ya está en uso."
@@ -322,6 +341,7 @@ async def signup_student(
 ):
     """
     Creates a new student account in Supabase Auth and registers them in our rel database schema.
+    Uses auth.sign_up() (anon key) so it works regardless of service key format.
     """
     if not student_in.email or not student_in.password or not student_in.nombre or student_in.edad is None:
         raise HTTPException(
@@ -335,25 +355,30 @@ async def signup_student(
             detail="La contraseña debe tener al menos 6 caracteres."
         )
 
-    # Register user in Supabase Auth
-    try:
-        supabase_client = get_supabase_client()
-        if not supabase_client:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Registro requiere conexión a Supabase.",
-            )
+    anon_client = get_supabase_anon_client()
+    service_client = get_supabase_client()
 
-        auth_response = supabase_client.auth.admin.create_user({
+    if not anon_client and not service_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registro requiere conexión a Supabase.",
+        )
+
+    supabase_uid = None
+    # Register user in Supabase Auth using sign_up (works with anon/publishable key)
+    try:
+        client_for_signup = anon_client or service_client
+        auth_response = client_for_signup.auth.sign_up({
             "email": student_in.email,
             "password": student_in.password,
-            "user_metadata": {
-                "name": student_in.nombre,
-                "role": "estudiante",
-                "carrera": student_in.carrera,
-                "universidad": student_in.universidad
-            },
-            "email_confirm": True
+            "options": {
+                "data": {
+                    "name": student_in.nombre,
+                    "role": "estudiante",
+                    "carrera": student_in.carrera,
+                    "universidad": student_in.universidad
+                }
+            }
         })
         
         if not auth_response or not auth_response.user:
@@ -363,13 +388,24 @@ async def signup_student(
             )
             
         supabase_uid = uuid.UUID(auth_response.user.id)
+
+        # Auto-confirm email using service client if available
+        if service_client:
+            try:
+                service_client.auth.admin.update_user_by_id(
+                    str(supabase_uid),
+                    {"email_confirm": True}
+                )
+            except Exception as confirm_err:
+                print(f"[Auth Signup Student] Email confirm warn: {confirm_err}", flush=True)
+
     except HTTPException as e:
         raise e
     except Exception as e:
         print(f"[Auth Signup Student Error] Exception: {e}", flush=True)
         print(f"[Auth Signup Student Error] Traceback:\n{traceback.format_exc()}", flush=True)
         err_msg = str(e).lower()
-        if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
+        if "already" in err_msg or "exists" in err_msg or "in use" in err_msg or "registered" in err_msg:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El correo ya está en uso."

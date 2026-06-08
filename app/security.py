@@ -9,22 +9,47 @@ import base64
 security_bearer = HTTPBearer()
 
 _supabase_client = None
+_supabase_anon_client = None
 
 
 def get_supabase_client():
-    """Cliente Supabase solo si hay URL válida configurada."""
+    """Cliente Supabase con service_role key — necesario para auth.admin.* operations."""
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
-    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
+    url = settings.SUPABASE_URL
+    key = settings.SUPABASE_SERVICE_KEY
+    if not url or not key:
         return None
-    if "supabase.co" not in settings.SUPABASE_URL:
+    if "supabase.co" not in url:
         return None
     try:
         from supabase import create_client
-        _supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        _supabase_client = create_client(url, key)
         return _supabase_client
-    except Exception:
+    except Exception as e:
+        print(f"[Security] Failed to create service client: {e}", flush=True)
+        return None
+
+
+def get_supabase_anon_client():
+    """Cliente Supabase con anon/publishable key — necesario para sign_in_with_password y sign_up."""
+    global _supabase_anon_client
+    if _supabase_anon_client is not None:
+        return _supabase_anon_client
+    url = settings.SUPABASE_URL
+    key = settings.SUPABASE_ANON_KEY
+    if not url or not key:
+        # fallback: si no hay anon key, usar service key como cliente
+        return get_supabase_client()
+    if "supabase.co" not in url:
+        return None
+    try:
+        from supabase import create_client
+        _supabase_anon_client = create_client(url, key)
+        return _supabase_anon_client
+    except Exception as e:
+        print(f"[Security] Failed to create anon client: {e}", flush=True)
         return None
 
 

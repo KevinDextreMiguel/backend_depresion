@@ -153,7 +153,7 @@ app = FastAPI(
 
 _cors_origins = [
     o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()
-] or ["http://localhost:5173", "http://127.0.0.1:5173"]
+] or ["http://localhost:5173", "http://127.0.0.1:5173","https://frontend-depresion.vercel.app"]
 
 app.add_middleware(
     CORSMiddleware,
