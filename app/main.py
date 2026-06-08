@@ -265,6 +265,53 @@ async def compatibility_login_student(payload: Dict[str, Any] = Body(...), db: S
     }
 
 
+@app.post("/make-server-d427d5bf/signup-student", status_code=status.HTTP_201_CREATED, include_in_schema=False)
+async def compatibility_signup_student(
+    payload: Dict[str, Any] = Body(...),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Compatibility endpoint: routes student registration through the legacy prefix
+    so Vercel's /make-server-d427d5bf proxy can forward it to Render.
+    """
+    from .routers.auth import signup_student
+    from .schemas import StudentSignup
+
+    print(f"[Compat signup-student] payload keys: {list(payload.keys())}", flush=True)
+
+    if request is None:
+        request = type('DummyRequest', (), {'client': None})()
+
+    try:
+        edad_raw = payload.get("edad")
+        edad_val = int(edad_raw) if edad_raw is not None else 0
+
+        student_in = StudentSignup(
+            email=payload.get("email", ""),
+            password=payload.get("password", ""),
+            nombre=payload.get("nombre", ""),
+            edad=edad_val,
+            genero=payload.get("genero"),
+            carrera=payload.get("carrera"),
+            universidad=payload.get("universidad"),
+        )
+    except Exception as ve:
+        print(f"[Compat signup-student] Validation error: {ve}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Datos inválidos: {str(ve)}"
+        )
+
+    result = await signup_student(student_in, request, db)
+    # result is an AuthTokenResponse — map to the AuthSession shape the frontend expects
+    return {
+        "access_token": result.access_token,
+        "token_type": result.token_type,
+        "user": result.user,
+    }
+
+
 @app.post("/make-server-d427d5bf/signup", status_code=status.HTTP_201_CREATED, include_in_schema=False)
 async def compatibility_signup(
     payload: Dict[str, Any] = Body(...),

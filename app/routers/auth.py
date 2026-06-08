@@ -6,6 +6,7 @@ from ..models import Usuario, Administrador, Psicologo, Estudiante, AuditoriaAcc
 from ..schemas import UserCreate, UserResponse, StudentSignup, AuthTokenResponse, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdateProfile
 from ..security import get_supabase_client, get_current_user
 import uuid
+import traceback
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -168,7 +169,8 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"[Auth Signup Error] Details: {e}", flush=True)
+        print(f"[Auth Signup Admin Error] Exception: {e}", flush=True)
+        print(f"[Auth Signup Admin Error] Traceback:\n{traceback.format_exc()}", flush=True)
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
             raise HTTPException(
@@ -364,7 +366,8 @@ async def signup_student(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"[Auth Signup Student Error] Details: {e}", flush=True)
+        print(f"[Auth Signup Student Error] Exception: {e}", flush=True)
+        print(f"[Auth Signup Student Error] Traceback:\n{traceback.format_exc()}", flush=True)
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
             raise HTTPException(
