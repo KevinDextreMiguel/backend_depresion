@@ -3,13 +3,25 @@ from sqlalchemy import Column, String, Integer, Boolean, DateTime, LargeBinary, 
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.types import TypeDecorator
 from .database import Base
+from .config import settings
+
+class EncryptedString(TypeDecorator):
+    impl = LargeBinary
+    cache_ok = True
+
+    def bind_expression(self, bindvalue):
+        return func.encrypt_sensible_data(bindvalue, settings.ENCRYPTION_KEY)
+
+    def column_expression(self, col):
+        return func.decrypt_sensible_data(col, settings.ENCRYPTION_KEY)
 
 class Usuario(Base):
     __tablename__ = "usuario"
 
     id_usuario = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    nombre = Column(String, nullable=False)
+    nombre = Column(EncryptedString, nullable=False)
     foto_perfil = Column(String, nullable=True)
     correo = Column(String, nullable=True)
     rol = Column(String(30), nullable=False)
