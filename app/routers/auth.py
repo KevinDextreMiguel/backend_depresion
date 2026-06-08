@@ -143,10 +143,9 @@ async def reset_password(request: ResetPasswordRequest):
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
 async def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
-    """Registro usando Supabase Auth (sign_up + confirm + perfil local)."""
-    anon_client = get_supabase_anon_client()
+    """Registro usando Supabase Auth admin.create_user (auto-confirma email)."""
     service_client = get_supabase_client()
-    if not anon_client and not service_client:
+    if not service_client:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Servicio de Supabase no configurado."
@@ -154,16 +153,14 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
 
     supabase_uid = None
     try:
-        # 1. Registrar en Supabase Auth usando sign_up (funciona con anon key)
-        client_for_signup = anon_client or service_client
-        auth_response = client_for_signup.auth.sign_up({
+        # Use admin API: creates user as confirmed, satisfies FK constraint on usuario table
+        auth_response = service_client.auth.admin.create_user({
             "email": user_in.email,
             "password": user_in.password,
-            "options": {
-                "data": {
-                    "name": user_in.nombre,
-                    "role": user_in.rol
-                }
+            "email_confirm": True,
+            "user_metadata": {
+                "name": user_in.nombre,
+                "role": user_in.rol
             }
         })
         
@@ -175,16 +172,6 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
             
         supabase_uid = uuid.UUID(auth_response.user.id)
 
-        # 2. Confirmar email automáticamente si tenemos service client
-        if service_client:
-            try:
-                service_client.auth.admin.update_user_by_id(
-                    str(supabase_uid),
-                    {"email_confirm": True}
-                )
-            except Exception as confirm_err:
-                print(f"[Auth Signup] Email confirm warn: {confirm_err}", flush=True)
-
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -195,6 +182,11 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El correo ya está en uso."
+            )
+        if "rate limit" in err_msg or "over_email_send_rate_limit" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Límite de registros alcanzado. Por favor intenta de nuevo en unos minutos."
             )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -355,29 +347,28 @@ async def signup_student(
             detail="La contraseña debe tener al menos 6 caracteres."
         )
 
-    anon_client = get_supabase_anon_client()
     service_client = get_supabase_client()
+    anon_client = get_supabase_anon_client()
 
-    if not anon_client and not service_client:
+    if not service_client:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Registro requiere conexión a Supabase.",
         )
 
     supabase_uid = None
-    # Register user in Supabase Auth using sign_up (works with anon/publishable key)
+    # Use admin.create_user with email_confirm=True so the user is immediately
+    # available in auth.users and satisfies the FK constraint on the usuario table
     try:
-        client_for_signup = anon_client or service_client
-        auth_response = client_for_signup.auth.sign_up({
+        auth_response = service_client.auth.admin.create_user({
             "email": student_in.email,
             "password": student_in.password,
-            "options": {
-                "data": {
-                    "name": student_in.nombre,
-                    "role": "estudiante",
-                    "carrera": student_in.carrera,
-                    "universidad": student_in.universidad
-                }
+            "email_confirm": True,
+            "user_metadata": {
+                "name": student_in.nombre,
+                "role": "estudiante",
+                "carrera": student_in.carrera,
+                "universidad": student_in.universidad
             }
         })
         
@@ -389,16 +380,6 @@ async def signup_student(
             
         supabase_uid = uuid.UUID(auth_response.user.id)
 
-        # Auto-confirm email using service client if available
-        if service_client:
-            try:
-                service_client.auth.admin.update_user_by_id(
-                    str(supabase_uid),
-                    {"email_confirm": True}
-                )
-            except Exception as confirm_err:
-                print(f"[Auth Signup Student] Email confirm warn: {confirm_err}", flush=True)
-
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -409,6 +390,11 @@ async def signup_student(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El correo ya está en uso."
+            )
+        if "rate limit" in err_msg or "over_email_send_rate_limit" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Límite de registros alcanzado. Por favor intenta de nuevo en unos minutos."
             )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -454,7 +440,8 @@ async def signup_student(
         db.commit()
 
         # Sign in with password to get the access token and login the user immediately
-        login_response = supabase_client.auth.sign_in_with_password({
+        login_client = anon_client or service_client
+        login_response = login_client.auth.sign_in_with_password({
             "email": student_in.email,
             "password": student_in.password
         })
