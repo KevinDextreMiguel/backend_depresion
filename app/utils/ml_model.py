@@ -7,6 +7,10 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import AdaBoostClassifier
+from xgboost import XGBClassifier
 
 # Configuración del modelo y reproducibilidad
 SEED_GLOBAL = 42
@@ -48,56 +52,177 @@ def make_preprocessor():
     
     return preprocessor
 
-def get_initial_dataset():
-    """Carga el dataset de excel de la raíz y define el target binario."""
-    if not os.path.exists(DATASET_PATH):
-        raise FileNotFoundError(f"No se encontró el dataset de depresión en {DATASET_PATH}")
-    
-    df = pd.read_excel(DATASET_PATH)
-    
-    # Construcción del target binario PHQ-9 >= 10
-    if 'phq9_total' in df.columns:
-        df['target_binario'] = (df['phq9_total'] >= 10).astype(int)
-    else:
-        categorias_positivas = ['Moderada', 'Moderadamente severa', 'Severa']
-        df['target_binario'] = df['depresion_objetivo'].isin(categorias_positivas).astype(int)
+def get_initial_dataset(db=None):
+    """Carga el dataset desde la tabla de base de datos vista_seudonimizada_ml."""
+    from ..database import SessionLocal
+    local_session = False
+    if db is None:
+        db = SessionLocal()
+        local_session = True
+    try:
+        from ..models import VistaSeudonimizadaML
+        records = db.query(VistaSeudonimizadaML).all()
         
-    return df
+        if not records:
+            # Fallback to local Excel if database is completely empty
+            if not os.path.exists(DATASET_PATH):
+                raise FileNotFoundError(f"No se encontró el dataset de depresión en {DATASET_PATH}")
+            df = pd.read_excel(DATASET_PATH)
+            if 'phq9_total' in df.columns:
+                df['target_binario'] = (df['phq9_total'] >= 10).astype(int)
+            else:
+                categorias_positivas = ['Moderada', 'Moderadamente severa', 'Severa']
+                df['target_binario'] = df['depresion_objetivo'].isin(categorias_positivas).astype(int)
+            return df
+        
+        data = []
+        for r in records:
+            if r.horas_sueno is not None and r.mspss_total is not None and r.historia_salud_mental is not None and r.calidad_sueno is not None:
+                # Construct target binary from phq9 sum (leakage-free target) if possible
+                q_sum = 0
+                has_qs = False
+                for q_idx in range(1, 10):
+                    val = getattr(r, f"q{q_idx}")
+                    if val is not None:
+                        q_sum += val
+                        has_qs = True
+                
+                if has_qs:
+                    target = 1 if q_sum >= 10 else 0
+                else:
+                    categorias_positivas = ['Moderada', 'Moderadamente severa', 'Severa', 'riesgo_depresion', 'alto_riesgo']
+                    target = 1 if r.prediction in categorias_positivas else 0
+                
+                data.append({
+                    "horas_sueno": r.horas_sueno,
+                    "mspss_total": r.mspss_total,
+                    "historia_salud_mental": r.historia_salud_mental,
+                    "calidad_sueno": r.calidad_sueno,
+                    "target_binario": target
+                })
+        
+        if not data:
+            # If records exist but all have null features, load fallback Excel
+            df = pd.read_excel(DATASET_PATH)
+            df['target_binario'] = (df['phq9_total'] >= 10).astype(int) if 'phq9_total' in df.columns else df['depresion_objetivo'].isin(['Moderada', 'Moderadamente severa', 'Severa']).astype(int)
+            return df
 
-def train_and_save_model(df=None):
+        return pd.DataFrame(data)
+    finally:
+        if local_session:
+            db.close()
+
+def get_classifiers():
+    return {
+        "LogisticRegression": LogisticRegression(
+            C=1.0, 
+            random_state=SEED_GLOBAL, 
+            max_iter=1000
+        ),
+        "DecisionTree": DecisionTreeClassifier(
+            max_depth=5, 
+            min_samples_leaf=10, 
+            random_state=SEED_GLOBAL
+        ),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_leaf=5,
+            class_weight='balanced',
+            random_state=SEED_GLOBAL,
+            n_jobs=-1
+        ),
+        "AdaBoost": AdaBoostClassifier(
+            n_estimators=100,
+            learning_rate=1.0,
+            random_state=SEED_GLOBAL
+        ),
+        "XGBoost": XGBClassifier(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.1,
+            random_state=SEED_GLOBAL,
+            eval_metric='logloss'
+        )
+    }
+
+def train_and_compare_models(df=None, db=None):
     """
-    Entrena el pipeline de RandomForest con los hiperparámetros ganadores 
-    del notebook sobre el DataFrame especificado (o el de excel por defecto) y lo serializa.
+    Entrena y compara 5 modelos clasificadores. Selecciona el modelo ganador basado
+    en balanced accuracy y lo guarda como el modelo de predicción activo.
     """
     if df is None:
-        df = get_initial_dataset()
+        df = get_initial_dataset(db)
         
     X = df[COLS_NUM + COLS_NOM + COLS_ORD].copy()
     y = df['target_binario']
     
-    preprocessor = make_preprocessor()
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, balanced_accuracy_score
     
-    # Hiperparámetros óptimos del RandomForest según el notebook
-    clf = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=10,
-        min_samples_leaf=5,
-        class_weight='balanced',
-        random_state=SEED_GLOBAL,
-        n_jobs=-1
+    # 80-20 Stratified Train-Validation Split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=SEED_GLOBAL, stratify=y
     )
     
-    pipeline = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', clf)
-    ])
+    classifiers = get_classifiers()
+    results = {}
+    pipelines = {}
     
-    pipeline.fit(X, y)
+    for name, clf in classifiers.items():
+        preprocessor = make_preprocessor()
+        pipeline = Pipeline([
+            ('preprocessor', preprocessor),
+            ('classifier', clf)
+        ])
+        
+        # Fit on train split
+        pipeline.fit(X_train, y_train)
+        
+        # Predict on val split
+        y_pred = pipeline.predict(X_val)
+        
+        # Calculate metrics
+        acc = float(accuracy_score(y_val, y_pred))
+        prec = float(precision_score(y_val, y_pred, zero_division=0))
+        rec = float(recall_score(y_val, y_pred, zero_division=0))
+        f1 = float(f1_score(y_val, y_pred, zero_division=0))
+        bal_acc = float(balanced_accuracy_score(y_val, y_pred))
+        
+        results[name] = {
+            "model_name": name,
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1_score": f1,
+            "balanced_accuracy": bal_acc
+        }
+        
+        # Fit pipeline on all data for deployment
+        full_pipeline = Pipeline([
+            ('preprocessor', make_preprocessor()),
+            ('classifier', clf)
+        ])
+        full_pipeline.fit(X, y)
+        pipelines[name] = full_pipeline
+        
+    # Select winner by balanced accuracy
+    winner_name = max(results, key=lambda k: results[k]["balanced_accuracy"])
     
-    # Guardar modelo entrenado
-    joblib.dump(pipeline, MODEL_PATH)
-    print(f"OK: Modelo ML entrenado y guardado en: {MODEL_PATH}")
-    return pipeline
+    # Save winning model
+    joblib.dump(pipelines[winner_name], MODEL_PATH)
+    print(f"OK: Modelo ML ganador '{winner_name}' guardado en: {MODEL_PATH}")
+    
+    # Add winner flag
+    for name in results:
+        results[name]["is_winner"] = (name == winner_name)
+        
+    return results, winner_name
+
+def train_and_save_model(df=None):
+    """Wrapper compatible para el pipeline antiguo de entrenamiento."""
+    results, winner_name = train_and_compare_models(df)
+    return results
 
 def load_trained_model():
     """Carga el modelo entrenado desde el archivo serializado, entrenándolo primero si no existe."""

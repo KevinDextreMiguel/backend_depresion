@@ -73,11 +73,6 @@ if _db_ok:
             print("[MindCheck] Configuración seed completada.")
         except Exception as seed_err:
             print(f"[MindCheck] Error al seedear configuración: {seed_err}")
-        if settings.is_sqlite and settings.USE_SUPABASE_DB:
-            print(
-                "[MindCheck] AVISO: Querías Supabase pero solo SQLite respondió. "
-                "Copia SUPABASE_POOLER_URL desde Dashboard → Connect → ORMs (Session mode)."
-            )
     except Exception as e:
         print(f"[MindCheck] Conexión OK pero error creando tablas: {e}")
 else:
@@ -191,7 +186,7 @@ async def root():
         "database": {
             "connected": db_ok,
             "detail": db_msg,
-            "provider": "supabase" if settings.is_supabase_postgres else "sqlite",
+            "provider": "supabase" if settings.is_supabase_postgres else "postgresql",
         },
     }
 
@@ -229,6 +224,33 @@ async def compatibility_login(payload: Dict[str, Any] = Body(...), db: Session =
     )
     # Map to AuthSession structure expected by frontend
     # Note: response.user is a dictionary, not a Pydantic model
+    return {
+        "access_token": response.access_token,
+        "token_type": response.token_type,
+        "user": {
+            "id": response.user.get("id") or str(response.user.get("id_usuario", "")),
+            "email": response.user.get("email") or response.user.get("correo", ""),
+            "nombre": response.user.get("nombre", ""),
+            "foto_perfil": response.user.get("foto_perfil"),
+            "rol": response.user.get("rol", "")
+        }
+    }
+
+
+@app.post("/make-server-d427d5bf/login-student", include_in_schema=False)
+async def compatibility_login_student(payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    """
+    Login route specifically for students. Uses the same login logic as /login
+    but verifies the user has the 'estudiante' role.
+    """
+    from .routers.auth import login
+    from .schemas import UserLogin
+
+    response = await login(
+        UserLogin(email=payload.get("email"), password=payload.get("password")),
+        db,
+    )
+    # Map to AuthSession structure expected by frontend
     return {
         "access_token": response.access_token,
         "token_type": response.token_type,
@@ -291,6 +313,65 @@ async def compatibility_signup(
             "rol": response.user.get("rol", "")
         }
     }
+
+
+@app.get("/make-server-d427d5bf/admin/users", include_in_schema=False)
+async def compatibility_get_all_users(
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
+    from .routers.admin import get_all_users
+    return await get_all_users(current_user, db)
+
+
+@app.put("/make-server-d427d5bf/admin/users/{user_id}", include_in_schema=False)
+async def compatibility_update_user(
+    user_id: UUID,
+    payload: Dict[str, Any] = Body(...),
+    request: Request = None,
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
+    from .routers.admin import update_user
+    from .schemas import UserUpdateRequest
+    if request is None:
+        request = type('DummyRequest', (), {'headers': {}, 'client': None})()
+    
+    body = UserUpdateRequest(
+        rol=payload.get("rol"),
+        activo=payload.get("activo")
+    )
+    return await update_user(user_id, body, request, current_user, db)
+
+
+@app.get("/make-server-d427d5bf/admin/model/status", include_in_schema=False)
+async def compatibility_get_model_status(
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
+    from .routers.admin import get_model_status
+    return await get_model_status(current_user, db)
+
+
+@app.post("/make-server-d427d5bf/admin/model/retrain", include_in_schema=False)
+async def compatibility_retrain_model(
+    payload: Dict[str, Any] = Body(...),
+    request: Request = None,
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
+    from .routers.admin import retrain_model
+    from .schemas import ModelRetrainRequest
+    if request is None:
+        request = type('DummyRequest', (), {'headers': {}, 'client': None})()
+    
+    body = ModelRetrainRequest(
+        model_name=payload.get("model_name"),
+        version=payload.get("version"),
+        origen_datos=payload.get("origen_datos"),
+        comentario=payload.get("comentario")
+    )
+    return await retrain_model(body, request, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/statistics", include_in_schema=False)

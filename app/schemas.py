@@ -305,12 +305,24 @@ class ModelStatusResponse(BaseModel):
     last_retrained_at: Optional[datetime] = None
     origen_datos: Optional[str] = None
     comentario: Optional[str] = None
+    accuracy: Optional[float] = None
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    f1_score: Optional[float] = None
 
 class ModelRetrainRequest(BaseModel):
     model_name: Optional[str] = Field("PHQ-9 Rule-based Engine", description="Nombre del modelo de entrenamiento")
     version: Optional[str] = Field(None, description="Versión nueva del modelo")
     origen_datos: Optional[str] = Field(None, description="Fuente de los datos usados para el reentrenamiento")
     comentario: Optional[str] = Field(None, description="Comentario o descripción del reentrenamiento")
+
+class ModelPerformance(BaseModel):
+    model_name: str
+    accuracy: float
+    precision: float
+    recall: float
+    f1_score: float
+    is_winner: bool
 
 class ModelRetrainResponse(BaseModel):
     success: bool
@@ -319,6 +331,7 @@ class ModelRetrainResponse(BaseModel):
     previous_version: Optional[str] = None
     updated_records: int
     message: str
+    comparison: Optional[list[ModelPerformance]] = None
 
 # --- Questionnaire Progress (Auto-save & Recovery) ---
 class ProgresoCreate(BaseModel):

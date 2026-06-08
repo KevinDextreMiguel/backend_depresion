@@ -273,9 +273,9 @@ class VistaSeudonimizadaML(Base):
     __tablename__ = "vista_seudonimizada_ml"
 
     id_registro = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    id_evaluacion = Column(UUID(as_uuid=True), ForeignKey("evaluacion.id_evaluacion", ondelete="CASCADE"), nullable=False, unique=True)
-    id_estudiante = Column(UUID(as_uuid=True), ForeignKey("estudiante.id_estudiante", ondelete="CASCADE"), nullable=False)
-    id_estudiante_hash = Column(String(255), nullable=False)
+    id_evaluacion = Column(UUID(as_uuid=True), ForeignKey("evaluacion.id_evaluacion", ondelete="CASCADE"), nullable=True, unique=True)
+    id_estudiante = Column(UUID(as_uuid=True), ForeignKey("estudiante.id_estudiante", ondelete="CASCADE"), nullable=True)
+    id_estudiante_hash = Column(String(255), nullable=True)
     rango_edad = Column(String(20), nullable=True)
     genero = Column(String(20), nullable=True)
     carrera_area = Column(String(100), nullable=True)

@@ -723,6 +723,12 @@ async def get_model_status(
             comentario="Versión inicial del modelo no encontrada en la base de datos."
         )
 
+    # Get latest metrics from AuditoriaModelML
+    audit = db.query(AuditoriaModelML).filter(
+        AuditoriaModelML.model_version == active_model.version,
+        AuditoriaModelML.tipo_evento == "entrenamiento"
+    ).order_by(AuditoriaModelML.fecha_evento.desc()).first()
+
     return ModelStatusResponse(
         model_name=active_model.nombre,
         version=active_model.version,
@@ -730,6 +736,10 @@ async def get_model_status(
         last_retrained_at=active_model.fecha_publicacion,
         origen_datos=active_model.origen_datos,
         comentario=active_model.comentario,
+        accuracy=float(audit.accuracy) if audit and audit.accuracy is not None else None,
+        precision=float(audit.precision) if audit and audit.precision is not None else None,
+        recall=float(audit.recall) if audit and audit.recall is not None else None,
+        f1_score=float(audit.f1_score) if audit and audit.f1_score is not None else None
     )
 
 
@@ -741,89 +751,49 @@ async def retrain_model(
     db: Session = Depends(get_db)
 ):
     """
-    Inicia un reentrenamiento de modelo con datos existentes de la vista seudonimizada
-    combinados con el dataset histórico de excel, y calcula métricas de desempeño.
+    Inicia un reentrenamiento y comparación de modelos utilizando el dataset completo
+    almacenado en la tabla vista_seudonimizada_ml de Supabase.
     """
-    import pandas as pd
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-    from ..utils.ml_model import train_and_save_model, get_initial_dataset, make_preprocessor
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.pipeline import Pipeline
-
-    # 1. Cargar registros nuevos desde la base de datos
-    registros = db.query(VistaSeudonimizadaML).all()
-    record_count = len(registros)
-
-    # 2. Cargar y combinar dataset base con nuevos registros
+    from ..utils.ml_model import train_and_compare_models, get_initial_dataset
+    
+    # 1. Cargar dataset completo desde la base de datos
     try:
-        df_base = get_initial_dataset()
+        df_combined = get_initial_dataset(db)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al cargar el dataset inicial de depresión: {str(e)}"
+            detail=f"Error al cargar el dataset de entrenamiento desde Supabase: {str(e)}"
         )
 
-    new_rows = []
-    for r in registros:
-        if r.horas_sueno is not None and r.mspss_total is not None and r.historia_salud_mental is not None and r.calidad_sueno is not None:
-            # Calcular target a partir de respuestas del PHQ-9 (leakage-free target)
-            q_sum = (r.q1 or 0) + (r.q2 or 0) + (r.q3 or 0) + (r.q4 or 0) + (r.q5 or 0) + (r.q6 or 0) + (r.q7 or 0) + (r.q8 or 0) + (r.q9 or 0)
-            new_rows.append({
-                "horas_sueno": r.horas_sueno,
-                "mspss_total": r.mspss_total,
-                "historia_salud_mental": r.historia_salud_mental,
-                "calidad_sueno": r.calidad_sueno,
-                "target_binario": 1 if q_sum >= 10 else 0
-            })
-
-    if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        df_combined = pd.concat([df_base, df_new], ignore_index=True)
-    else:
-        df_combined = df_base
-
-    # 3. Calcular métricas reales con un split de validación estratificado
+    # 2. Entrenar y comparar todos los modelos
     try:
-        X_comb = df_combined[["horas_sueno", "mspss_total", "historia_salud_mental", "calidad_sueno"]].copy()
-        y_comb = df_combined["target_binario"]
-        
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_comb, y_comb, test_size=0.2, random_state=42, stratify=y_comb
-        )
-        
-        val_pipeline = Pipeline([
-            ('preprocessor', make_preprocessor()),
-            ('classifier', RandomForestClassifier(
-                n_estimators=200,
-                max_depth=10,
-                min_samples_leaf=5,
-                class_weight='balanced',
-                random_state=42,
-                n_jobs=-1
-            ))
-        ])
-        val_pipeline.fit(X_train, y_train)
-        y_pred = val_pipeline.predict(X_test)
-        
-        val_acc = float(accuracy_score(y_test, y_pred))
-        val_prec = float(precision_score(y_test, y_pred, zero_division=0))
-        val_rec = float(recall_score(y_test, y_pred, zero_division=0))
-        val_f1 = float(f1_score(y_test, y_pred, zero_division=0))
-    except Exception as metrics_err:
-        # Fallback a métricas estimadas en caso de falla
-        val_acc, val_prec, val_rec, val_f1 = 0.85, 0.82, 0.80, 0.81
-
-    # 4. Entrenar el modelo final con el 100% de los datos y guardarlo
-    try:
-        train_and_save_model(df_combined)
+        train_results, winner_name = train_and_compare_models(df_combined, db)
     except Exception as train_err:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error durante el reentrenamiento del modelo RandomForest: {str(train_err)}"
+            detail=f"Error durante el reentrenamiento y comparación de modelos: {str(train_err)}"
         )
 
-    # 5. Registrar la nueva versión del modelo en la base de datos
+    # Winner details
+    winner_metrics = train_results[winner_name]
+    val_acc = winner_metrics["accuracy"]
+    val_prec = winner_metrics["precision"]
+    val_rec = winner_metrics["recall"]
+    val_f1 = winner_metrics["f1_score"]
+
+    # Map to performance response
+    comparison_list = []
+    for name, r in train_results.items():
+        comparison_list.append({
+            "model_name": name,
+            "accuracy": r["accuracy"],
+            "precision": r["precision"],
+            "recall": r["recall"],
+            "f1_score": r["f1_score"],
+            "is_winner": r["is_winner"]
+        })
+
+    # 3. Registrar la nueva versión del modelo en la base de datos
     active_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
     previous_version = f"{active_model.nombre} v{active_model.version}" if active_model else None
 
@@ -839,7 +809,7 @@ async def retrain_model(
         else:
             version = "1.1"
 
-    model_name = payload.model_name or "RandomForest"
+    model_name = winner_name
 
     if active_model:
         active_model.activo = False
@@ -848,14 +818,14 @@ async def retrain_model(
     new_model = ModeloVersion(
         nombre=model_name,
         version=version,
-        origen_datos=payload.origen_datos or f"dataset histórico + {record_count} nuevos registros",
-        comentario=payload.comentario or "Reentrenamiento real del RandomForest (Bloque B).",
+        origen_datos=payload.origen_datos or f"Supabase (dataset histórico + nuevos registros)",
+        comentario=payload.comentario or f"Reentrenamiento y comparación. Modelo ganador: {winner_name}.",
         activo=True,
     )
     db.add(new_model)
     db.commit()
 
-    # 6. Registrar evento en la tabla de AuditoriaModelML
+    # 4. Registrar evento en la tabla de AuditoriaModelML
     client_ip = request.client.host if request.client else "127.0.0.1"
     admin_id = UUID(current_user["id"])
     
@@ -867,7 +837,7 @@ async def retrain_model(
         recall=val_rec,
         f1_score=val_f1,
         accuracy=val_acc,
-        resultado_prediccion=f"Reentrenado con {len(df_combined)} registros en total."
+        resultado_prediccion=f"Modelo ganador: {winner_name}. Total registros: {len(df_combined)}."
     )
     db.add(audit_ml)
 
@@ -878,7 +848,7 @@ async def retrain_model(
         tabla_objetivo="modelo_version",
         id_objetivo=new_model.id_modelo,
         ip_origen=client_ip,
-        detalle=f"Reentrenó el modelo {model_name} a la versión {version}. Registros totales: {len(df_combined)}. Accuracy: {val_acc:.4f}"
+        detalle=f"Reentrenó y comparó modelos. Ganador: {winner_name} v{version}. Registros totales: {len(df_combined)}."
     )
     db.add(auditoria)
     db.commit()
@@ -889,7 +859,8 @@ async def retrain_model(
         version=version,
         previous_version=previous_version,
         updated_records=len(df_combined),
-        message=f"Reentrenamiento completado exitosamente. Accuracy estimado: {val_acc:.2%}"
+        message=f"Reentrenamiento completado. Modelo ganador: '{winner_name}' con balanced_accuracy={winner_metrics['balanced_accuracy']:.2%}",
+        comparison=comparison_list
     )
 
 

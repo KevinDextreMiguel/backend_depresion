@@ -306,7 +306,7 @@ async def update_profile(
     return db_user
 
 
-@router.post("/signup-student", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/signup-student", response_model=AuthTokenResponse, status_code=status.HTTP_201_CREATED)
 async def signup_student(
     student_in: StudentSignup, 
     request: Request, 
@@ -405,9 +405,23 @@ async def signup_student(
         db.add(db_audit)
         db.commit()
 
-        db_user = db.query(Usuario).filter(Usuario.id_usuario == supabase_uid).first()
+        # Sign in with password to get the access token and login the user immediately
+        login_response = supabase_client.auth.sign_in_with_password({
+            "email": student_in.email,
+            "password": student_in.password
+        })
+        if not login_response or not login_response.session:
+            raise Exception("No se pudo iniciar sesión automáticamente después del registro.")
 
-        return db_user
+        return AuthTokenResponse(
+            access_token=login_response.session.access_token,
+            user={
+                "id": str(supabase_uid),
+                "email": student_in.email,
+                "nombre": student_in.nombre,
+                "rol": "estudiante"
+            }
+        )
 
     except Exception as e:
         db.rollback()

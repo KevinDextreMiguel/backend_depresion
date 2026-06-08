@@ -80,9 +80,46 @@ async def submit_questionnaire_simple(
         db.commit()
 
     # 3. Crear perfil de estudiante con datos ingresados
+    # Priority: 1) Bearer token (authenticated user), 2) test_user_id from payload, 3) random UUID
     test_user_id = payload.test_user_id
+    auth_user_id = None
+    
+    # Try to get authenticated user from Bearer token
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            # Try JWT decode first
+            import jwt as pyjwt
+            from ..config import settings
+            try:
+                decoded = pyjwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+                auth_user_id = decoded.get("sub")
+            except Exception:
+                pass
+            
+            # Try Supabase validation if JWT failed
+            if not auth_user_id:
+                from ..security import get_supabase_client
+                supabase = get_supabase_client()
+                if supabase:
+                    try:
+                        user_resp = supabase.auth.get_user(token)
+                        if user_resp and user_resp.user:
+                            auth_user_id = user_resp.user.id
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    
     try:
-        anon_user_id = uuid.UUID(test_user_id) if test_user_id else uuid.uuid4()
+        if auth_user_id:
+            # Use authenticated user's ID
+            anon_user_id = uuid.UUID(auth_user_id)
+        elif test_user_id:
+            anon_user_id = uuid.UUID(test_user_id)
+        else:
+            anon_user_id = uuid.uuid4()
     except Exception:
         anon_user_id = uuid.uuid4()
     

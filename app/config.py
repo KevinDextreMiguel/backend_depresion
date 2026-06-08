@@ -16,8 +16,8 @@ def _extract_project_ref(supabase_url: str) -> str:
 
 def build_database_url() -> str:
     """
-    Si AUTO_RESOLVE_DB=true (por defecto), prueba pooler/direct/SQLite al arrancar.
-  Si no, construye URL directa o SQLite sin probar conexión.
+    Si AUTO_RESOLVE_DB=true (por defecto), prueba pooler/direct al arrancar.
+    Si no, construye URL directa de Supabase sin probar conexión.
     """
     if os.getenv("AUTO_RESOLVE_DB", "true").lower() in ("1", "true", "yes"):
         from .db_resolver import resolve_database_url
@@ -32,21 +32,23 @@ def build_database_url() -> str:
     if pooler_url:
         return pooler_url
 
-    use_supabase = os.getenv("USE_SUPABASE_DB", "true").lower() in ("1", "true", "yes")
     password = os.getenv("SUPABASE_DB_PASSWORD", "").strip()
     project_ref = os.getenv(
         "SUPABASE_PROJECT_REF",
         _extract_project_ref(os.getenv("SUPABASE_URL", "")),
     )
 
-    if use_supabase and password and project_ref:
+    if password and project_ref:
         encoded_password = quote_plus(password)
         return (
             f"postgresql://postgres:{encoded_password}"
             f"@db.{project_ref}.supabase.co:5432/postgres?sslmode=require"
         )
 
-    return "sqlite:///./mindcheck_local.db"
+    raise RuntimeError(
+        "No se pudo resolver la conexión a la base de datos. "
+        "Define DATABASE_URL, SUPABASE_POOLER_URL o la combinación de SUPABASE_DB_PASSWORD y SUPABASE_PROJECT_REF."
+    )
 
 
 class Settings(BaseSettings):
@@ -58,11 +60,6 @@ class Settings(BaseSettings):
         "http://localhost:5173,http://127.0.0.1:5173",
     )
 
-    USE_SUPABASE_DB: bool = os.getenv("USE_SUPABASE_DB", "true").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     SUPABASE_PROJECT_REF: str = os.getenv("SUPABASE_PROJECT_REF", "")
 
     DATABASE_URL: str = build_database_url()
@@ -84,12 +81,8 @@ class Settings(BaseSettings):
     AUTH_MODE: str = os.getenv("AUTH_MODE", "local")
 
     @property
-    def is_sqlite(self) -> bool:
-        return self.DATABASE_URL.startswith("sqlite")
-
-    @property
     def is_supabase_postgres(self) -> bool:
-        return "supabase.co" in self.DATABASE_URL
+        return "supabase.co" in self.DATABASE_URL or "pooler.supabase.com" in self.DATABASE_URL
 
     class Config:
         case_sensitive = True

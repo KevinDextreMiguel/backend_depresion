@@ -13,9 +13,11 @@ from sqlalchemy import create_engine, text
 
 def _test_url(url: str, timeout: int = 8) -> bool:
     try:
-        kw: dict = {"pool_pre_ping": True}
-        if url.startswith("sqlite"):
-            kw["connect_args"] = {"check_same_thread": False}
+        kw: dict = {
+            "pool_pre_ping": True,
+            "pool_size": 3,
+            "max_overflow": 5,
+        }
         engine = create_engine(url, **kw)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -37,7 +39,6 @@ def _candidate_urls() -> list[tuple[str, str]]:
     if pooler:
         out.append(("SUPABASE_POOLER_URL", pooler))
 
-    use_supabase = os.getenv("USE_SUPABASE_DB", "true").lower() in ("1", "true", "yes")
     password = os.getenv("SUPABASE_DB_PASSWORD", "").strip()
     project_ref = os.getenv("SUPABASE_PROJECT_REF", "").strip()
     if not project_ref:
@@ -45,7 +46,7 @@ def _candidate_urls() -> list[tuple[str, str]]:
         if "supabase.co" in url:
             project_ref = url.replace("https://", "").split(".")[0]
 
-    if use_supabase and password and project_ref:
+    if password and project_ref:
         enc = quote_plus(password)
 
         region = os.getenv("SUPABASE_REGION", "").strip()
@@ -78,7 +79,6 @@ def _candidate_urls() -> list[tuple[str, str]]:
         )
         out.append(("direct-ipv6", direct))
 
-    out.append(("sqlite-local", "sqlite:///./mindcheck_local.db"))
     return out
 
 
@@ -86,15 +86,10 @@ def resolve_database_url(verbose: bool = True) -> str:
     for label, url in _candidate_urls():
         if _test_url(url):
             if verbose:
-                if url.startswith("sqlite"):
-                    print(
-                        "[MindCheck] Usando SQLite local. Para Supabase, define "
-                        "SUPABASE_POOLER_URL en .env (Dashboard -> Connect -> ORMs -> Session)."
-                    )
-                else:
-                    print(f"[MindCheck] Conexión OK ({label})")
+                print(f"[MindCheck] Conexión OK ({label})")
             return url
 
-    if verbose:
-        print("[MindCheck] Ninguna conexión Supabase funcionó; usando SQLite local.")
-    return "sqlite:///./mindcheck_local.db"
+    raise RuntimeError(
+        "Ninguna conexión a la base de datos de Supabase funcionó. "
+        "Por favor verifique sus variables de entorno o la conexión de red."
+    )

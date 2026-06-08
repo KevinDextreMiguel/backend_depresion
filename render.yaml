@@ -1,0 +1,28 @@
+# Render Blueprint specification for Salud Mental API backend
+# Deploy by linking your GitHub repository to Render and selecting render.yaml
+services:
+  - type: web
+    name: backend-depresion
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: AUTO_RESOLVE_DB
+        value: "true"
+      - key: AUTH_MODE
+        value: "supabase"
+      - key: ENCRYPTION_KEY
+        value: "super-secret-key-depression-screening-app-2026"
+      # The following variables are secrets and must be configured manually in the Render dashboard:
+      - key: SUPABASE_PROJECT_REF
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
