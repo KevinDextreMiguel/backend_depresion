@@ -8,7 +8,7 @@ from .database import Base
 from .config import settings
 
 class EncryptedString(TypeDecorator):
-    impl = LargeBinary
+    impl = String
     cache_ok = True
 
     def bind_expression(self, bindvalue):
