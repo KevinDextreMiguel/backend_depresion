@@ -50,6 +50,8 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
                 "rol": usuario.rol
             }
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         err_msg = str(e).lower()
         if "invalid login credentials" in err_msg:
@@ -162,6 +164,8 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
             )
             
         supabase_uid = uuid.UUID(auth_response.user.id)
+    except HTTPException as e:
+        raise e
     except Exception as e:
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
@@ -355,6 +359,8 @@ async def signup_student(
             )
             
         supabase_uid = uuid.UUID(auth_response.user.id)
+    except HTTPException as e:
+        raise e
     except Exception as e:
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
