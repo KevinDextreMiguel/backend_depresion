@@ -11,7 +11,7 @@ from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
 
-def _test_url(url: str, timeout: int = 8) -> bool:
+def _test_url(url: str, timeout: int = 8) -> tuple[bool, str]:
     try:
         kw: dict = {
             "pool_pre_ping": True,
@@ -22,9 +22,9 @@ def _test_url(url: str, timeout: int = 8) -> bool:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         engine.dispose()
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def _candidate_urls() -> list[tuple[str, str]]:
@@ -83,13 +83,35 @@ def _candidate_urls() -> list[tuple[str, str]]:
 
 
 def resolve_database_url(verbose: bool = True) -> str:
-    for label, url in _candidate_urls():
-        if _test_url(url):
+    errors = []
+    candidates = _candidate_urls()
+    if not candidates:
+        raise RuntimeError(
+            "No se encontraron candidatos de conexión. Asegúrate de configurar DATABASE_URL, "
+            "SUPABASE_POOLER_URL o la combinación de SUPABASE_DB_PASSWORD y SUPABASE_PROJECT_REF en tus variables de entorno."
+        )
+
+    for label, url in candidates:
+        # Ocultar contraseña en logs
+        safe_url = url
+        if "@" in url:
+            parts = url.split("@")
+            prefix = parts[0].split(":")
+            if len(prefix) > 2:
+                safe_url = f"{prefix[0]}:{prefix[1]}:***@{parts[1]}"
+        
+        ok, err = _test_url(url)
+        if ok:
             if verbose:
                 print(f"[MindCheck] Conexión OK ({label})")
             return url
+        else:
+            err_msg = f"{label}: {err} (URL: {safe_url})"
+            errors.append(err_msg)
+            if verbose:
+                print(f"[MindCheck] Falló conexión ({label}): {err}")
 
+    details = "\n".join(errors)
     raise RuntimeError(
-        "Ninguna conexión a la base de datos de Supabase funcionó. "
-        "Por favor verifique sus variables de entorno o la conexión de red."
+        f"Ninguna conexión a la base de datos de Supabase funcionó.\nDetalles de los intentos:\n{details}"
     )
