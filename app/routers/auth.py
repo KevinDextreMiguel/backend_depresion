@@ -53,6 +53,7 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
     except HTTPException as e:
         raise e
     except Exception as e:
+        print(f"[Auth Login Error] Details: {e}", flush=True)
         err_msg = str(e).lower()
         if "invalid login credentials" in err_msg:
             raise HTTPException(
@@ -167,6 +168,7 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
     except HTTPException as e:
         raise e
     except Exception as e:
+        print(f"[Auth Signup Error] Details: {e}", flush=True)
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
             raise HTTPException(
@@ -175,7 +177,7 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
             )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error en Supabase Auth: {str(e)}"
+            detail=f"Error al registrar cuenta: {str(e)}"
         )
 
     # 3. Create profile in our custom `usuario` table using pg_sym_encrypt (pgcrypto)
@@ -362,6 +364,7 @@ async def signup_student(
     except HTTPException as e:
         raise e
     except Exception as e:
+        print(f"[Auth Signup Student Error] Details: {e}", flush=True)
         err_msg = str(e).lower()
         if "already" in err_msg or "exists" in err_msg or "in use" in err_msg:
             raise HTTPException(
