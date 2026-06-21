@@ -213,40 +213,33 @@ async def submit_questionnaire_simple(
     # 4. Asignar psicólogo activo por defecto
     psicologo = db.query(Psicologo).filter(Psicologo.activo == True).first()
     if not psicologo:
-        # Use a fixed deterministic UUID for the default system psychologist to avoid FK conflicts
-        DEFAULT_PSICO_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        # No active psicologo — try to create a system one using the student's auth user ID
+        # The student's user ID IS valid in auth.users (Supabase) so no FK violation
         try:
-            existing_psico_usuario = db.query(Usuario).filter(Usuario.id_usuario == DEFAULT_PSICO_USER_ID).first()
-            if not existing_psico_usuario:
-                psico_user = Usuario(
-                    id_usuario=DEFAULT_PSICO_USER_ID,
-                    nombre=db_encrypt("Sistema MindCheck"),
-                    correo=db_encrypt("sistema@mindcheck.pe"),
-                    rol="psicologo",
+            # Look for any existing psicologo (active or inactive)
+            psicologo = db.query(Psicologo).first()
+            if not psicologo:
+                # Create a placeholder psicologo linked to the student's own user record
+                # (This user exists in auth.users, satisfying the FK constraint)
+                psicologo_fallback = Psicologo(
+                    id_psicologo=uuid.uuid4(),
+                    id_usuario=anon_user_id,
+                    especialidad="Salud Mental General",
+                    numero_colegiatura="SISTEMA",
                     activo=True
                 )
-                db.add(psico_user)
+                db.add(psicologo_fallback)
                 db.commit()
-
-            psicologo = Psicologo(
-                id_psicologo=uuid.UUID("00000000-0000-0000-0000-000000000002"),
-                id_usuario=DEFAULT_PSICO_USER_ID,
-                especialidad="Salud Mental General",
-                numero_colegiatura="COP-00001",
-                activo=True
-            )
-            # Use merge to avoid duplicate key errors
-            db.merge(psicologo)
-            db.commit()
-            psicologo = db.query(Psicologo).filter(Psicologo.activo == True).first()
+                psicologo = psicologo_fallback
         except Exception as psico_err:
             db.rollback()
-            print(f"[MindCheck] Error creando psicólogo por defecto: {psico_err}")
+            print(f"[MindCheck] Error asignando psicólogo: {psico_err}")
+            # Last resort: try to query again
             psicologo = db.query(Psicologo).first()
             if not psicologo:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="No hay psicólogos disponibles en el sistema."
+                    detail="No hay psicólogos disponibles en el sistema. Por favor contacte al administrador."
                 )
 
     # 5. Crear Evaluacion
