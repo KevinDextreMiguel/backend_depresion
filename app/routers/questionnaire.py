@@ -53,20 +53,30 @@ async def submit_questionnaire_simple(
         db.add(cuestionario)
         db.commit()
 
-    # 2. Asegurar preguntas en BD
-    existing_questions = db.query(Pregunta).filter(Pregunta.id_cuestionario == cuestionario.id_cuestionario).count()
-    if existing_questions == 0:
-        default_phq9 = [
-            "Poco interés o placer en hacer las cosas",
-            "Sentirse deprimido, triste o sin esperanza",
-            "Dificultad para conciliar el sueño o dormir demasiado",
-            "Sentirse cansado o con poca energía",
-            "Disminución del apetito o comer en exceso",
-            "Sentirse mal contigo mismo —o que eres un fracaso— o que has defraudado a tu familia",
-            "Dificultad para concentrarte en cosas, como leer el periódico o ver la televisión",
-            "Moverte o hablar tan lento que otras personas podrían haberlo notado, o lo contrario — estar tan inquieto que te mueves mucho más de lo habitual",
-            "Pensamientos de que estarías mejor muerto o de hacerte daño de alguna manera"
-        ]
+    # 2. Asegurar exactamente 9 preguntas en BD
+    default_phq9 = [
+        "Poco interés o placer en hacer las cosas",
+        "Sentirse deprimido, triste o sin esperanza",
+        "Dificultad para conciliar el sueño o dormir demasiado",
+        "Sentirse cansado o con poca energía",
+        "Disminución del apetito o comer en exceso",
+        "Sentirse mal contigo mismo —o que eres un fracaso— o que has defraudado a tu familia",
+        "Dificultad para concentrarte en cosas, como leer el periódico o ver la televisión",
+        "Moverte o hablar tan lento que otras personas podrían haberlo notado, o lo contrario — estar tan inquieto que te mueves mucho más de lo habitual",
+        "Pensamientos de que estarías mejor muerto o de hacerte daño de alguna manera"
+    ]
+    existing_questions = db.query(Pregunta).filter(
+        Pregunta.id_cuestionario == cuestionario.id_cuestionario
+    ).count()
+    if existing_questions != len(default_phq9):
+        # Delete any partial/corrupted questions and recreate all
+        try:
+            db.query(Pregunta).filter(
+                Pregunta.id_cuestionario == cuestionario.id_cuestionario
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception:
+            db.rollback()
         for idx, txt in enumerate(default_phq9, start=1):
             q = Pregunta(
                 id_pregunta=uuid.uuid4(),
@@ -203,53 +213,71 @@ async def submit_questionnaire_simple(
     # 4. Asignar psicólogo activo por defecto
     psicologo = db.query(Psicologo).filter(Psicologo.activo == True).first()
     if not psicologo:
-        test_psico_user = payload.test_psicologo_user_id
+        # Use a fixed deterministic UUID for the default system psychologist to avoid FK conflicts
+        DEFAULT_PSICO_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
         try:
-            psico_user_id = uuid.UUID(test_psico_user) if test_psico_user else anon_user_id
-        except Exception:
-            psico_user_id = anon_user_id
+            existing_psico_usuario = db.query(Usuario).filter(Usuario.id_usuario == DEFAULT_PSICO_USER_ID).first()
+            if not existing_psico_usuario:
+                psico_user = Usuario(
+                    id_usuario=DEFAULT_PSICO_USER_ID,
+                    nombre=db_encrypt("Sistema MindCheck"),
+                    correo=db_encrypt("sistema@mindcheck.pe"),
+                    rol="psicologo",
+                    activo=True
+                )
+                db.add(psico_user)
+                db.commit()
 
-        existing_psico_usuario = db.query(Usuario).filter(Usuario.id_usuario == psico_user_id).first()
-        if not existing_psico_usuario:
-            psico_user = Usuario(
-                id_usuario=psico_user_id,
-                nombre=db_encrypt("Dra. Sarah Chen"),
-                correo=db_encrypt("s.chen@upc.edu.pe"),
-                rol="psicologo",
+            psicologo = Psicologo(
+                id_psicologo=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                id_usuario=DEFAULT_PSICO_USER_ID,
+                especialidad="Salud Mental General",
+                numero_colegiatura="COP-00001",
                 activo=True
             )
-            db.add(psico_user)
+            # Use merge to avoid duplicate key errors
+            db.merge(psicologo)
             db.commit()
-
-        psicologo = Psicologo(
-            id_psicologo=uuid.uuid4(),
-            id_usuario=psico_user_id,
-            especialidad="Terapia Cognitivo Conductual",
-            numero_colegiatura="COP-49201",
-            activo=True
-        )
-        db.add(psicologo)
-        db.commit()
+            psicologo = db.query(Psicologo).filter(Psicologo.activo == True).first()
+        except Exception as psico_err:
+            db.rollback()
+            print(f"[MindCheck] Error creando psicólogo por defecto: {psico_err}")
+            psicologo = db.query(Psicologo).first()
+            if not psicologo:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="No hay psicólogos disponibles en el sistema."
+                )
 
     # 5. Crear Evaluacion
-    eval_id = uuid.uuid4()
-    db_eval = Evaluacion(
-        id_evaluacion=eval_id,
-        id_estudiante=student_id,
-        id_cuestionario=cuestionario.id_cuestionario,
-        id_psicologo=psicologo.id_psicologo,
-        estado="completada",
-        consentimiento_verificado=True
-    )
-    db.add(db_eval)
-    db.commit()
-
-    # 6. Guardar respuestas del PHQ-9 en base de datos
-    questions = db.query(Pregunta).filter(Pregunta.id_cuestionario == cuestionario.id_cuestionario).order_by(Pregunta.orden).all()
-    if len(questions) != 9:
+    try:
+        eval_id = uuid.uuid4()
+        db_eval = Evaluacion(
+            id_evaluacion=eval_id,
+            id_estudiante=student_id,
+            id_cuestionario=cuestionario.id_cuestionario,
+            id_psicologo=psicologo.id_psicologo,
+            estado="completada",
+            consentimiento_verificado=True
+        )
+        db.add(db_eval)
+        db.commit()
+    except Exception as eval_err:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Las preguntas del cuestionario PHQ-9 no están completamente inicializadas."
+            detail=f"Error al registrar evaluación: {str(eval_err)}"
+        )
+
+    # 6. Guardar respuestas del PHQ-9 en base de datos
+    questions = db.query(Pregunta).filter(
+        Pregunta.id_cuestionario == cuestionario.id_cuestionario
+    ).order_by(Pregunta.orden).all()
+    if len(questions) != 9:
+        # Should not happen after step 2, but just in case
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error interno: se encontraron {len(questions)} preguntas en lugar de 9."
         )
 
     score = 0
