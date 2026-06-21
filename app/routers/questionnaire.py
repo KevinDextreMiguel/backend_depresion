@@ -298,8 +298,8 @@ async def submit_questionnaire_simple(
     mspss_total = sum(payload.mspss_respuestas)
 
     # 8. Inferencia en tiempo real con el modelo de Machine Learning (RandomForest Bloque B)
-    from ..utils.ml_model import predict_depression_risk
     try:
+        from ..utils.ml_model import predict_depression_risk
         ml_pred, ml_prob = predict_depression_risk(
             horas_sueno=payload.horas_sueno,
             mspss_total=mspss_total,
