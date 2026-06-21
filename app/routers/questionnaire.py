@@ -162,8 +162,7 @@ async def submit_questionnaire_simple(
                 edad=payload.edad,
                 genero=payload.genero,
                 carrera=payload.carrera,
-                universidad=payload.universidad,
-                activo=True
+                universidad=payload.universidad
             )
             db.add(db_student)
         else:
