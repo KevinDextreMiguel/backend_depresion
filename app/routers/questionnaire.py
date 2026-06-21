@@ -407,46 +407,50 @@ async def submit_questionnaire_simple(
         print(f"[MindCheck] Error en auditoría ML: {audit_ml_err}")
 
     # 12. Insertar en Vista Seudonimizada ML con todas las variables recolectadas
-    salt = "mindcheck-salt-2026"
-    student_hash = hashlib.sha256(f"{student_id.hex}-{salt}".encode()).hexdigest()
-    
-    rango_edad = "18-20" if db_student.edad <= 20 else "21-25" if db_student.edad <= 25 else "25+"
-    carrera_area = "Ingenierías" if "Ingeniería" in db_student.carrera else "Ciencias de la Salud" if db_student.carrera in ["Medicina", "Psicología"] else "Humanidades y Negocios"
-    
-    current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
-    origin_model = f"{current_model.nombre} v{current_model.version}" if current_model else "RandomForest v1.0"
+    try:
+        salt = "mindcheck-salt-2026"
+        student_hash = hashlib.sha256(f"{student_id.hex}-{salt}".encode()).hexdigest()
+        
+        rango_edad = "18-20" if db_student.edad <= 20 else "21-25" if db_student.edad <= 25 else "25+"
+        carrera_area = "Ingenierías" if "Ingeniería" in db_student.carrera else "Ciencias de la Salud" if db_student.carrera in ["Medicina", "Psicología"] else "Humanidades y Negocios"
+        
+        current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
+        origin_model = f"{current_model.nombre} v{current_model.version}" if current_model else "RandomForest v1.0"
 
-    db_ml = VistaSeudonimizadaML(
-        id_registro=uuid.uuid4(),
-        id_evaluacion=eval_id,
-        id_estudiante=student_id,
-        id_estudiante_hash=student_hash,
-        rango_edad=rango_edad,
-        genero=db_student.genero,
-        carrera_area=carrera_area,
-        universidad=db_student.universidad,
-        q1=payload.phq9_respuestas[0],
-        q2=payload.phq9_respuestas[1],
-        q3=payload.phq9_respuestas[2],
-        q4=payload.phq9_respuestas[3],
-        q5=payload.phq9_respuestas[4],
-        q6=payload.phq9_respuestas[5],
-        q7=payload.phq9_respuestas[6],
-        q8=payload.phq9_respuestas[7],
-        q9=payload.phq9_respuestas[8],
-        prediction="riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
-        origen_modelo=origin_model,
-        note=f"Inferencia en tiempo real (RF). Probabilidad: {ml_prob}%.",
-        horas_sueno=payload.horas_sueno,
-        calidad_sueno=payload.calidad_sueno,
-        historia_salud_mental=payload.historia_salud_mental,
-        mspss_total=mspss_total,
-        promedio_ponderado=payload.promedio_ponderado,
-        ciclo=payload.ciclo,
-        edad=payload.edad
-    )
-    db.add(db_ml)
-    db.commit()
+        db_ml = VistaSeudonimizadaML(
+            id_registro=uuid.uuid4(),
+            id_evaluacion=eval_id,
+            id_estudiante=student_id,
+            id_estudiante_hash=student_hash,
+            rango_edad=rango_edad,
+            genero=db_student.genero,
+            carrera_area=carrera_area,
+            universidad=db_student.universidad,
+            q1=payload.phq9_respuestas[0],
+            q2=payload.phq9_respuestas[1],
+            q3=payload.phq9_respuestas[2],
+            q4=payload.phq9_respuestas[3],
+            q5=payload.phq9_respuestas[4],
+            q6=payload.phq9_respuestas[5],
+            q7=payload.phq9_respuestas[6],
+            q8=payload.phq9_respuestas[7],
+            q9=payload.phq9_respuestas[8],
+            prediction="riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
+            origen_modelo=origin_model,
+            note=f"Inferencia en tiempo real (RF). Probabilidad: {ml_prob}%.",
+            horas_sueno=payload.horas_sueno,
+            calidad_sueno=payload.calidad_sueno,
+            historia_salud_mental=payload.historia_salud_mental,
+            mspss_total=mspss_total,
+            promedio_ponderado=payload.promedio_ponderado,
+            ciclo=payload.ciclo,
+            edad=payload.edad
+        )
+        db.add(db_ml)
+        db.commit()
+    except Exception as ml_view_err:
+        db.rollback()
+        print(f"[MindCheck] Advertencia: No se pudo insertar en vista_seudonimizada_ml: {ml_view_err}")
 
     return {
         "success": True,
