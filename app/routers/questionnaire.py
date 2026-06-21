@@ -466,7 +466,7 @@ async def submit_questionnaire_simple(
 # AUTO-SAVE & RECOVERY ENDPOINTS (HU0008)
 # ============================================================================
 
-@router.post("/progress/save", response_model=ProgresoResponse, status_code=status.HTTP_200_OK)
+@router.post("/progress/save")
 async def save_progress(
     payload: ProgresoCreate,
     db: Session = Depends(get_db)
@@ -474,36 +474,57 @@ async def save_progress(
     """
     Save or update questionnaire progress automatically.
     Creates a new progress record if it doesn't exist, otherwise updates it.
+    Non-critical: returns success even if DB save fails.
     """
-    # Check if progress already exists for this session
-    existing_progress = db.query(ProgresoCuestionario).filter(
-        ProgresoCuestionario.session_id == payload.session_id
-    ).first()
+    try:
+        # Ensure the cuestionario exists (creates it if not, avoids FK error)
+        cuestionario = db.query(Cuestionario).filter(
+            Cuestionario.id_cuestionario == payload.cuestionario_id
+        ).first()
+        if not cuestionario:
+            cuestionario = Cuestionario(
+                id_cuestionario=payload.cuestionario_id,
+                nombre="Cuestionario sobre la Salud del Paciente (PHQ-9)",
+                descripcion="Herramienta de tamizaje para detectar y medir la gravedad de la depresión.",
+                estado="activo",
+                version="1.0",
+                activo=True
+            )
+            db.add(cuestionario)
+            db.commit()
 
-    if existing_progress:
-        # Update existing progress
-        existing_progress.pregunta_actual = payload.pregunta_actual
-        existing_progress.respuestas = payload.respuestas
-        existing_progress.consentimiento_aceptado = payload.consentimiento_aceptado
-        existing_progress.ultima_actualizacion = datetime.utcnow()
-        existing_progress.activo = True
-        db.commit()
-        db.refresh(existing_progress)
-        return existing_progress
-    else:
-        # Create new progress record
-        new_progress = ProgresoCuestionario(
-            session_id=payload.session_id,
-            id_cuestionario=payload.cuestionario_id,
-            pregunta_actual=payload.pregunta_actual,
-            respuestas=payload.respuestas,
-            consentimiento_aceptado=payload.consentimiento_aceptado,
-            activo=True
-        )
-        db.add(new_progress)
-        db.commit()
-        db.refresh(new_progress)
-        return new_progress
+        # Check if progress already exists for this session
+        existing_progress = db.query(ProgresoCuestionario).filter(
+            ProgresoCuestionario.session_id == payload.session_id
+        ).first()
+
+        if existing_progress:
+            existing_progress.pregunta_actual = payload.pregunta_actual
+            existing_progress.respuestas = payload.respuestas
+            existing_progress.consentimiento_aceptado = payload.consentimiento_aceptado
+            existing_progress.ultima_actualizacion = datetime.utcnow()
+            existing_progress.activo = True
+            db.commit()
+            db.refresh(existing_progress)
+            return existing_progress
+        else:
+            new_progress = ProgresoCuestionario(
+                session_id=payload.session_id,
+                id_cuestionario=payload.cuestionario_id,
+                pregunta_actual=payload.pregunta_actual,
+                respuestas=payload.respuestas,
+                consentimiento_aceptado=payload.consentimiento_aceptado,
+                activo=True
+            )
+            db.add(new_progress)
+            db.commit()
+            db.refresh(new_progress)
+            return new_progress
+    except Exception as e:
+        db.rollback()
+        print(f"[MindCheck] Advertencia: No se pudo guardar progreso: {e}")
+        # Return a neutral 200 so the client doesn't get CORS-less 500 errors
+        return {"saved": False, "message": "Auto-guardado omitido temporalmente."}
 
 
 @router.get("/progress/recover/{session_id}")
