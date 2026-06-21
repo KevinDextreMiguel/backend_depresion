@@ -263,27 +263,36 @@ async def submit_questionnaire_simple(
         )
 
     # 6. Guardar respuestas del PHQ-9 en base de datos
+    print(f"[MindCheck] Paso 6: guardando respuestas PHQ-9 para evaluacion {eval_id}", flush=True)
     questions = db.query(Pregunta).filter(
         Pregunta.id_cuestionario == cuestionario.id_cuestionario
     ).order_by(Pregunta.orden).all()
     if len(questions) != 9:
-        # Should not happen after step 2, but just in case
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error interno: se encontraron {len(questions)} preguntas en lugar de 9."
         )
 
     score = 0
-    for idx, ans_val in enumerate(payload.phq9_respuestas):
-        score += ans_val
-        pregunta = questions[idx]
-        db_ans = Respuesta(
-            id_respuesta=uuid.uuid4(),
-            id_evaluacion=eval_id,
-            id_pregunta=pregunta.id_pregunta,
-            valor=ans_val
+    try:
+        for idx, ans_val in enumerate(payload.phq9_respuestas):
+            score += ans_val
+            pregunta = questions[idx]
+            db_ans = Respuesta(
+                id_respuesta=uuid.uuid4(),
+                id_evaluacion=eval_id,
+                id_pregunta=pregunta.id_pregunta,
+                valor=ans_val
+            )
+            db.add(db_ans)
+        db.flush()
+    except Exception as resp_err:
+        db.rollback()
+        print(f"[MindCheck] Error guardando respuestas: {resp_err}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al guardar respuestas PHQ-9: {str(resp_err)}"
         )
-        db.add(db_ans)
 
     # 7. Calcular score de MSPSS total
     mspss_total = sum(payload.mspss_respuestas)
@@ -297,9 +306,9 @@ async def submit_questionnaire_simple(
             historia_salud_mental=payload.historia_salud_mental,
             calidad_sueno=payload.calidad_sueno
         )
+        print(f"[MindCheck] Inferencia ML OK: pred={ml_pred}, prob={ml_prob}", flush=True)
     except Exception as ml_err:
-        # Fallback por reglas si el modelo falla o no está disponible
-        print(f"[MindCheck] Inferencia fallida, aplicando fallback por reglas: {ml_err}")
+        print(f"[MindCheck] Inferencia fallida, aplicando fallback por reglas: {ml_err}", flush=True)
         ml_pred = 1 if score >= 10 else 0
         ml_prob = float(round((score / 27.0) * 100, 2))
 
@@ -320,28 +329,39 @@ async def submit_questionnaire_simple(
     suicide_alert = q9_value >= 1
 
     # 9. Insertar resultado clínico e interpretabilidad de ML
-    result_id = uuid.uuid4()
-    db_result = Resultado(
-        id_resultado=result_id,
-        id_evaluacion=eval_id,
-        nivel_riesgo=risk_level,
-        probabilidad=float(round(ml_prob, 2)),
-        interpretabilidad={
-            "score": score,
-            "q9_value": q9_value,
-            "risk_factors": ["item_9_alert" if suicide_alert else None],
-            "tree_path": "root -> phq9_score -> " + risk_level,
-            "ml_prediction": "riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
-            "ml_probability": ml_prob,
-            "horas_sueno": payload.horas_sueno,
-            "mspss_total": mspss_total,
-            "calidad_sueno": payload.calidad_sueno,
-            "historia_salud_mental": payload.historia_salud_mental
-        },
-        alerta_suicidio=suicide_alert
-    )
-    db.add(db_result)
-    db.commit()
+    print(f"[MindCheck] Paso 9: guardando resultado. score={score}, riesgo={risk_level}", flush=True)
+    try:
+        result_id = uuid.uuid4()
+        db_result = Resultado(
+            id_resultado=result_id,
+            id_evaluacion=eval_id,
+            nivel_riesgo=risk_level,
+            probabilidad=float(round(ml_prob, 2)),
+            interpretabilidad={
+                "score": score,
+                "q9_value": q9_value,
+                "risk_factors": ["item_9_alert" if suicide_alert else None],
+                "tree_path": "root -> phq9_score -> " + risk_level,
+                "ml_prediction": "riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
+                "ml_probability": ml_prob,
+                "horas_sueno": payload.horas_sueno,
+                "mspss_total": mspss_total,
+                "calidad_sueno": payload.calidad_sueno,
+                "historia_salud_mental": payload.historia_salud_mental
+            },
+            alerta_suicidio=suicide_alert
+        )
+        db.add(db_result)
+        db.commit()
+        print(f"[MindCheck] Resultado guardado OK: {result_id}", flush=True)
+    except Exception as res_err:
+        db.rollback()
+        print(f"[MindCheck] Error guardando resultado: {res_err}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al guardar resultado clínico: {str(res_err)}"
+        )
+
 
     # 10. Derivación automática si se requiere
     if suicide_alert or risk_level in ["moderadamente_severo", "severo"]:
