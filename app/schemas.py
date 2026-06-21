@@ -33,6 +33,12 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
     access_token: str
 
+class EstudianteProfile(PyModel):
+    edad: Optional[int] = None
+    genero: Optional[str] = None
+    carrera: Optional[str] = None
+    universidad: Optional[str] = None
+
 class UserResponse(UserBase):
     id_usuario: UUID
     nombre: str
@@ -40,12 +46,17 @@ class UserResponse(UserBase):
     correo: str
     fecha_registro: datetime
     activo: bool
+    estudiante: Optional[EstudianteProfile] = None
 
     model_config = {"populate_by_name": True}
 
 class UserUpdateProfile(BaseModel):
     nombre: str = Field(..., min_length=1, description="Nombre completo del usuario")
     foto_perfil: Optional[str] = Field(None, description="Imagen en formato base64")
+    edad: Optional[int] = Field(None, description="Edad del estudiante")
+    genero: Optional[str] = Field(None, description="Género del estudiante")
+    carrera: Optional[str] = Field(None, description="Carrera del estudiante")
+    universidad: Optional[str] = Field(None, description="Universidad del estudiante")
 
 class UserUpdateRequest(BaseModel):
     rol: Optional[str] = Field(None, description="Nuevo rol del usuario: admin, psicologo, estudiante")

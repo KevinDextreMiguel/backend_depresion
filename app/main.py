@@ -233,7 +233,8 @@ async def compatibility_login(payload: Dict[str, Any] = Body(...), db: Session =
             "email": response.user.get("email") or response.user.get("correo", ""),
             "nombre": response.user.get("nombre", ""),
             "foto_perfil": response.user.get("foto_perfil"),
-            "rol": response.user.get("rol", "")
+            "rol": response.user.get("rol", ""),
+            "estudiante": response.user.get("estudiante")
         }
     }
 
@@ -260,7 +261,8 @@ async def compatibility_login_student(payload: Dict[str, Any] = Body(...), db: S
             "email": response.user.get("email") or response.user.get("correo", ""),
             "nombre": response.user.get("nombre", ""),
             "foto_perfil": response.user.get("foto_perfil"),
-            "rol": response.user.get("rol", "")
+            "rol": response.user.get("rol", ""),
+            "estudiante": response.user.get("estudiante")
         }
     }
 

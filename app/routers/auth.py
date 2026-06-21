@@ -46,12 +46,24 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
                 detail="Cuenta desactivada o no encontrada en base de datos local."
             )
             
+        estudiante_data = None
+        if usuario.rol == "estudiante" and usuario.estudiante:
+            estudiante_data = {
+                "edad": usuario.estudiante.edad,
+                "genero": usuario.estudiante.genero,
+                "carrera": usuario.estudiante.carrera,
+                "universidad": usuario.estudiante.universidad
+            }
+
         return AuthTokenResponse(
             access_token=response.session.access_token,
             user={
                 "id": response.user.id,
                 "email": credentials.email,
-                "rol": usuario.rol
+                "nombre": usuario.nombre,
+                "foto_perfil": usuario.foto_perfil,
+                "rol": usuario.rol,
+                "estudiante": estudiante_data
             }
         )
     except HTTPException as e:
@@ -309,6 +321,17 @@ async def update_profile(
     db_user.nombre = profile_data.nombre
     db_user.foto_perfil = profile_data.foto_perfil
     
+    # Update estudiante demographic data if provided
+    if db_user.rol == "estudiante" and db_user.estudiante:
+        if profile_data.edad is not None:
+            db_user.estudiante.edad = profile_data.edad
+        if profile_data.genero is not None:
+            db_user.estudiante.genero = profile_data.genero
+        if profile_data.carrera is not None:
+            db_user.estudiante.carrera = profile_data.carrera
+        if profile_data.universidad is not None:
+            db_user.estudiante.universidad = profile_data.universidad
+            
     db.commit()
     db.refresh(db_user)
     

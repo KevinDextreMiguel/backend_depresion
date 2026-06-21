@@ -80,7 +80,7 @@ async def submit_questionnaire_simple(
         db.commit()
 
     # 3. Crear perfil de estudiante con datos ingresados
-    # Priority: 1) Bearer token (authenticated user), 2) test_user_id from payload, 3) random UUID
+    # Priority: 1) Bearer token (authenticated user), 2) test_user_id from payload
     test_user_id = payload.test_user_id
     auth_user_id = None
     
@@ -88,47 +88,60 @@ async def submit_questionnaire_simple(
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
+        # Try Supabase validation first (most reliable for Supabase-issued tokens)
         try:
-            # Try JWT decode first
-            import jwt as pyjwt
-            from ..config import settings
-            try:
-                decoded = pyjwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-                auth_user_id = decoded.get("sub")
-            except Exception:
-                pass
-            
-            # Try Supabase validation if JWT failed
-            if not auth_user_id:
-                from ..security import get_supabase_client
-                supabase = get_supabase_client()
-                if supabase:
-                    try:
-                        user_resp = supabase.auth.get_user(token)
-                        if user_resp and user_resp.user:
-                            auth_user_id = user_resp.user.id
-                    except Exception:
-                        pass
+            from ..security import get_supabase_client
+            supabase = get_supabase_client()
+            if supabase:
+                try:
+                    user_resp = supabase.auth.get_user(token)
+                    if user_resp and user_resp.user:
+                        auth_user_id = user_resp.user.id
+                        print(f"[MindCheck] Auth OK via Supabase: {auth_user_id}", flush=True)
+                except Exception as sup_err:
+                    print(f"[MindCheck] Supabase auth failed: {sup_err}", flush=True)
         except Exception:
             pass
+        
+        # Fallback: Try local JWT decode
+        if not auth_user_id:
+            try:
+                import jwt as pyjwt
+                from ..config import settings
+                decoded = pyjwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+                auth_user_id = decoded.get("sub")
+                if auth_user_id:
+                    print(f"[MindCheck] Auth OK via local JWT: {auth_user_id}", flush=True)
+            except Exception as jwt_err:
+                print(f"[MindCheck] Local JWT decode failed: {jwt_err}", flush=True)
     
     try:
         if auth_user_id:
-            # Use authenticated user's ID
+            # Use authenticated user's ID — already exists in auth.users and usuario
             anon_user_id = uuid.UUID(auth_user_id)
         elif test_user_id:
             anon_user_id = uuid.UUID(test_user_id)
         else:
-            anon_user_id = uuid.uuid4()
+            # No valid authentication — require login
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Se requiere iniciar sesión para completar el cuestionario. Por favor, inicia sesión o regístrate."
+            )
+    except HTTPException:
+        raise
     except Exception:
-        anon_user_id = uuid.uuid4()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autenticación inválido. Por favor, inicia sesión nuevamente."
+        )
     
     client_ip = request.client.host if request.client else "127.0.0.1"
     
     try:
-        # Reutilizar o crear Usuario
+        # Reutilizar o crear Usuario (debe existir en auth.users para cumplir el FK)
         anon_user = db.query(Usuario).filter(Usuario.id_usuario == anon_user_id).first()
         if not anon_user:
+            # Only create if user exists in auth.users (authenticated users always do)
             anon_user = Usuario(
                 id_usuario=anon_user_id,
                 nombre=db_encrypt(f"Estudiante Anónimo #{random.randint(1000, 9999)}"),
@@ -178,8 +191,11 @@ async def submit_questionnaire_simple(
             db.add(db_consent)
 
         db.commit()
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
+        print(f"[MindCheck] Error creando perfil: {e}", flush=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error al crear perfil del estudiante: {str(e)}"
