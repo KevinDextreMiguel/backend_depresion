@@ -151,17 +151,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_cors_origins = [
+_cors_origins_from_env = [
     o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()
-] or ["http://localhost:5173", "http://127.0.0.1:5173","https://frontend-depresion.vercel.app"]
+]
+
+# Always ensure these origins are included, regardless of env config
+_always_allowed = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "https://frontend-depresion.vercel.app",
+]
+_cors_origins = list(set(_cors_origins_from_env + _always_allowed))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_origin_regex=r"https?://.*",  # Permite cualquier origen (incluyendo Vercel) con credenciales de forma dinámica
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 app.add_exception_handler(HTTPException, http_exception_handler)

@@ -506,14 +506,14 @@ async def save_progress(
         return new_progress
 
 
-@router.get("/progress/recover/{session_id}", response_model=ProgresoResponse, status_code=status.HTTP_200_OK)
+@router.get("/progress/recover/{session_id}")
 async def recover_progress(
     session_id: str,
     db: Session = Depends(get_db)
 ):
     """
     Recover questionnaire progress for a given session ID.
-    Returns the saved progress if it exists and is active.
+    Returns the saved progress if it exists and is active, or null if not found.
     """
     progress = db.query(ProgresoCuestionario).filter(
         ProgresoCuestionario.session_id == session_id,
@@ -521,10 +521,8 @@ async def recover_progress(
     ).first()
 
     if not progress:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No se encontró progreso guardado para esta sesión."
-        )
+        # Return null/empty instead of 404 to avoid CORS issues on the client
+        return None
 
     return progress
 
@@ -543,10 +541,7 @@ async def delete_progress(
     ).first()
 
     if not progress:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No se encontró progreso para esta sesión."
-        )
+        return {"success": True, "message": "No había progreso para esta sesión."}
 
     # Mark as inactive instead of deleting
     progress.activo = False
