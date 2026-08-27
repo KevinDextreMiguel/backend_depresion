@@ -7,6 +7,7 @@ from cryptography.fernet import Fernet
 import base64
 
 security_bearer = HTTPBearer()
+security_bearer_optional = HTTPBearer(auto_error=False)
 
 _supabase_client = None
 _supabase_anon_client = None
@@ -143,6 +144,21 @@ async def get_current_user(
             )
 
     raise HTTPException(status_code=401, detail="Token de acceso inválido o expirado")
+
+
+async def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials = Depends(security_bearer_optional),
+) -> dict | None:
+    """
+    Igual que get_current_user, pero no exige que el request traiga un Bearer token.
+    Usado en endpoints que deben seguir aceptando flujos anónimos (ej. progreso de
+    cuestionario antes de iniciar sesión) pero que, si el llamante SÍ envía un token,
+    deben validarlo igual que cualquier ruta autenticada — evita que un token ausente
+    se use como forma de eludir la verificación de propiedad de un recurso.
+    """
+    if credentials is None:
+        return None
+    return await get_current_user(credentials)
 
 
 def require_role(roles_allowed: list[str]):

@@ -340,6 +340,9 @@ async def compatibility_signup(
     email = payload.get("email")
     password = payload.get("password")
     name = payload.get("name", "Admin")
+    # Rol elegido en el formulario de registro (admin o psicologo). Se mantiene
+    # "admin" por defecto para no romper llamadas antiguas que no lo envíen.
+    rol = payload.get("rol", "admin")
 
     if not email or not password:
         raise HTTPException(
@@ -347,13 +350,20 @@ async def compatibility_signup(
             detail="Correo y contraseña son obligatorios.",
         )
 
+    if rol not in ("admin", "psicologo"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rol no válido para este formulario de registro.",
+        )
+
     user_in = UserCreate(
         email=email,
         password=password,
         nombre=name,
-        rol="admin",
+        rol=rol,
+        admin_invite_code=payload.get("admin_invite_code"),
     )
-    # Execute signup
+    # Execute signup (requiere ADMIN_SIGNUP_CODE válido — ver T-003 en auth.py::signup)
     await signup(user_in, request, db)
     
     # After signup, login to return the token

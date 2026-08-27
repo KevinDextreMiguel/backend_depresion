@@ -33,6 +33,36 @@ from ..security import require_role, get_supabase_client
 
 router = APIRouter(prefix="/admin", tags=["Administration & Reports"])
 
+
+def _resolve_psicologo(current_user: dict, db: Session) -> Psicologo | None:
+    """Devuelve el registro Psicologo del usuario autenticado, o None si es admin/no aplica."""
+    if current_user.get("role") != "psicologo":
+        return None
+    try:
+        return db.query(Psicologo).filter(Psicologo.id_usuario == UUID(current_user["id"])).first()
+    except Exception:
+        return None
+
+
+def _assert_student_in_scope(psicologo: Psicologo | None, student_id, db: Session) -> None:
+    """
+    T-002: si quien llama es un psicólogo (no admin), exige que el estudiante tenga
+    al menos una evaluación asignada a ese psicólogo antes de exponer su historial
+    clínico, observaciones o intervenciones. Evita que un psicólogo consulte/edite
+    el expediente de un paciente que no le fue asignado solo conociendo su ID.
+    """
+    if psicologo is None:
+        return
+    has_access = db.query(Evaluacion).filter(
+        Evaluacion.id_estudiante == student_id,
+        Evaluacion.id_psicologo == psicologo.id_psicologo,
+    ).first()
+    if not has_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Este estudiante no está asignado a tu cartera de pacientes.",
+        )
+
 @router.get("/statistics", response_model=StatisticsResponse)
 async def get_statistics(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -107,7 +137,7 @@ async def get_reports(
     including clinical metadata like career, risk level, and date.
     """
     # Join Evaluacion, Resultado, Estudiante
-    results = db.query(
+    query = db.query(
         Evaluacion.id_evaluacion,
         Evaluacion.fecha_evaluacion,
         Resultado.nivel_riesgo,
@@ -120,7 +150,16 @@ async def get_reports(
         Resultado, Evaluacion.id_evaluacion == Resultado.id_evaluacion
     ).join(
         Estudiante, Evaluacion.id_estudiante == Estudiante.id_estudiante
-    ).order_by(Evaluacion.fecha_evaluacion.desc()).all()
+    )
+
+    # Un psicólogo solo debe ver los reportes de los estudiantes que le fueron
+    # asignados, no el listado completo del sistema (mismo criterio que
+    # assigned-patients / student-history — ver hallazgo T-002).
+    psicologo = _resolve_psicologo(current_user, db)
+    if psicologo is not None:
+        query = query.filter(Evaluacion.id_psicologo == psicologo.id_psicologo)
+
+    results = query.order_by(Evaluacion.fecha_evaluacion.desc()).all()
 
     report_list = []
     for row in results:
@@ -167,6 +206,8 @@ async def get_student_history(
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
+    _assert_student_in_scope(_resolve_psicologo(current_user, db), student.id_estudiante, db)
+
     history_rows = (
         db.query(
             Evaluacion.id_evaluacion,
@@ -210,6 +251,14 @@ async def get_student_history(
             for o in obs
         ]
 
+        # HU0018 (T-005): expone la interpretabilidad al psicólogo, no solo al
+        # estudiante en el momento de envío. Se obtiene por fila (no vía GROUP BY,
+        # ya que Postgres 'json' plano no soporta igualdad para agrupar).
+        resultado_row = db.query(Resultado.interpretabilidad).filter(
+            Resultado.id_evaluacion == row.id_evaluacion
+        ).first()
+        interpretabilidad = resultado_row.interpretabilidad if resultado_row else None
+
         results.append(
             StudentHistoryItem(
                 id_anonimo=f"#{student.id_estudiante.hex[:6].upper()}",
@@ -223,6 +272,7 @@ async def get_student_history(
                 alerta_suicidio=row.alerta_suicidio,
                 carrera=row.carrera,
                 universidad=row.universidad,
+                interpretabilidad=interpretabilidad,
                 estado_evaluacion=row.estado,
                 comentarios=row.comentarios,
                 observaciones=obs_list,
@@ -495,19 +545,14 @@ async def create_student_observation(
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
+    psicologo = _resolve_psicologo(current_user, db)
+    _assert_student_in_scope(psicologo, student.id_estudiante, db)
+
     # If an evaluation is provided, validate it belongs to the student
     if body.id_evaluacion is not None:
         ev = db.query(Evaluacion).filter(Evaluacion.id_evaluacion == body.id_evaluacion).first()
         if ev is None or ev.id_estudiante != student.id_estudiante:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Evaluación inválida para este estudiante")
-
-    psicologo = None
-    try:
-        user_id = current_user.get("id")
-        if user_id:
-            psicologo = db.query(Psicologo).filter(Psicologo.id_usuario == UUID(user_id)).first()
-    except Exception:
-        psicologo = None
 
     new_obs = ObservacionSeguimiento(
         id_evaluacion=body.id_evaluacion,
@@ -541,6 +586,15 @@ async def update_student_observation(
     obs = db.query(ObservacionSeguimiento).filter(ObservacionSeguimiento.id_observacion == observation_id).first()
     if obs is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Observación no encontrada")
+
+    # T-007: solo el psicólogo autor de la observación (o un admin) puede editarla.
+    psicologo = _resolve_psicologo(current_user, db)
+    if psicologo is not None and obs.id_psicologo != psicologo.id_psicologo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el psicólogo que registró esta observación puede editarla.",
+        )
+
     if body.texto is not None:
         obs.texto = body.texto
     db.add(obs)
@@ -965,6 +1019,8 @@ async def get_student_interventions(
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
+    _assert_student_in_scope(_resolve_psicologo(current_user, db), student.id_estudiante, db)
+
     interventions = (
         db.query(Intervencion)
         .filter(Intervencion.id_estudiante == student.id_estudiante)
@@ -1003,17 +1059,21 @@ async def create_student_intervention(
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
-    # Resolve active psychologist
-    psicologo = None
-    try:
-        user_id = current_user.get("id")
-        if user_id:
-            psicologo = db.query(Psicologo).filter(Psicologo.id_usuario == UUID(user_id)).first()
-    except Exception:
-        psicologo = None
+    psicologo = _resolve_psicologo(current_user, db)
+    _assert_student_in_scope(psicologo, student.id_estudiante, db)
 
     if psicologo is None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Psicólogo no encontrado para el usuario actual")
+        # id_psicologo es NOT NULL en el modelo: incluso un admin necesita un
+        # registro Psicologo propio para quedar como autor de la intervención.
+        try:
+            psicologo = db.query(Psicologo).filter(Psicologo.id_usuario == UUID(current_user["id"])).first()
+        except Exception:
+            psicologo = None
+        if psicologo is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Se requiere un perfil de psicólogo para registrar intervenciones.",
+            )
 
     new_intervention = Intervencion(
         id_estudiante=student.id_estudiante,
@@ -1042,6 +1102,14 @@ async def update_clinical_intervention(
     intervention = db.query(Intervencion).filter(Intervencion.id_intervencion == intervention_id).first()
     if intervention is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Intervención no encontrada")
+
+    # T-007: solo el psicólogo autor de la intervención (o un admin) puede editarla.
+    psicologo = _resolve_psicologo(current_user, db)
+    if psicologo is not None and intervention.id_psicologo != psicologo.id_psicologo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el psicólogo que registró esta intervención puede editarla.",
+        )
 
     if body.tipo_intervencion is not None:
         if not body.tipo_intervencion.strip():

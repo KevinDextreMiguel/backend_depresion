@@ -141,7 +141,7 @@ def run_tests():
         print("SUCCESS: Updated intervention successfully.")
 
         print("\n==================================================")
-        print("ALL AUTOMATED TESTS PASSED SUCCESSFULLY! ✅")
+        print("ALL AUTOMATED TESTS PASSED SUCCESSFULLY.")
         print("==================================================")
 
     finally:

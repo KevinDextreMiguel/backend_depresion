@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from uuid import UUID
 from datetime import datetime
 
@@ -8,14 +8,22 @@ class PyModel(BaseModel):
     class Config:
         from_attributes = True
 
+# T-003: catálogo cerrado de roles — evita que cualquier string arbitrario
+# (enviado por un cliente no autenticado) se persista como rol del sistema.
+UserRole = Literal["estudiante", "psicologo", "admin", "investigador"]
+
 # --- Authentication & User Profiles ---
 class UserBase(PyModel):
-    rol: str = Field(..., description="Role: admin, psicologo, estudiante")
+    rol: UserRole = Field(..., description="Role: admin, psicologo, estudiante, investigador")
 
 class UserCreate(UserBase):
     email: EmailStr
     password: str
     nombre: str
+    admin_invite_code: Optional[str] = Field(
+        None,
+        description="Requerido únicamente para autoregistrarse con un rol privilegiado (admin, psicologo, investigador).",
+    )
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -59,7 +67,7 @@ class UserUpdateProfile(BaseModel):
     universidad: Optional[str] = Field(None, description="Universidad del estudiante")
 
 class UserUpdateRequest(BaseModel):
-    rol: Optional[str] = Field(None, description="Nuevo rol del usuario: admin, psicologo, estudiante")
+    rol: Optional[UserRole] = Field(None, description="Nuevo rol del usuario: admin, psicologo, estudiante, investigador")
     activo: Optional[bool] = Field(None, description="Estado de acceso del usuario")
 
 # --- Roles Schema Extensions ---
@@ -273,6 +281,7 @@ class StudentHistoryItem(BaseModel):
     estado_evaluacion: Optional[str] = None
     comentarios: Optional[str] = None
     observaciones: List[ObservacionResponse] = []
+    interpretabilidad: Optional[Dict[str, Any]] = None
 
 
 class StudentEvolutionItem(BaseModel):
@@ -553,10 +562,14 @@ class MLModelMetricsDetail(BaseModel):
     version: str
     nombre: str
     fecha: datetime
-    precision: float
-    recall: float
-    f1_score: float
-    accuracy: float
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    f1_score: Optional[float] = None
+    accuracy: Optional[float] = None
     training_samples: int
+    is_simulated: bool = Field(
+        default=False,
+        description="True si no existe un registro real de entrenamiento (AuditoriaModelML) para esta versión; en ese caso las métricas son null, no inventadas.",
+    )
 
 

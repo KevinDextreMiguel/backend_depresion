@@ -325,6 +325,7 @@ class ProgresoCuestionario(Base):
 
     id_progreso = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(String(255), nullable=False, unique=True, index=True)
+    id_usuario = Column(UUID(as_uuid=True), nullable=True, index=True)
     id_cuestionario = Column(UUID(as_uuid=True), ForeignKey("cuestionario.id_cuestionario", ondelete="CASCADE"), nullable=False)
     pregunta_actual = Column(Integer, nullable=False, default=0)
     respuestas = Column(JSON, nullable=False)

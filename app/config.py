@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # local = JWT en FastAPI (tablas en Supabase Postgres); supabase = Supabase Auth
     AUTH_MODE: str = os.getenv("AUTH_MODE", "local")
 
+    # T-003: código requerido para autoregistrarse con un rol privilegiado
+    # (admin, psicologo, investigador). Sin este código configurado, el registro
+    # de esos roles queda deshabilitado y solo un admin existente puede asignarlos
+    # vía PUT /admin/users/{id}.
+    ADMIN_SIGNUP_CODE: str = os.getenv("ADMIN_SIGNUP_CODE", "")
+
     @property
     def is_supabase_postgres(self) -> bool:
         return "supabase.co" in self.DATABASE_URL or "pooler.supabase.com" in self.DATABASE_URL

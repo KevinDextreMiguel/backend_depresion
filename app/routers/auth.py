@@ -5,6 +5,7 @@ from ..database import get_db
 from ..models import Usuario, Administrador, Psicologo, Estudiante, AuditoriaAcceso
 from ..schemas import UserCreate, UserResponse, StudentSignup, AuthTokenResponse, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdateProfile
 from ..security import get_supabase_client, get_supabase_anon_client, get_current_user
+from ..config import settings
 import uuid
 import traceback
 
@@ -156,6 +157,19 @@ async def reset_password(request: ResetPasswordRequest):
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
 async def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
     """Registro usando Supabase Auth admin.create_user (auto-confirma email)."""
+    # T-003: el autoregistro público solo puede crear cuentas de estudiante.
+    # Un rol privilegiado (admin/psicologo/investigador) requiere el código de
+    # invitación configurado en el servidor — si no está configurado, ese rol
+    # queda inalcanzable por este endpoint público, y solo un admin existente
+    # puede asignarlo vía PUT /admin/users/{id}.
+    if user_in.rol != "estudiante":
+        expected_code = settings.ADMIN_SIGNUP_CODE
+        if not expected_code or user_in.admin_invite_code != expected_code:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El registro con este rol requiere autorización de un administrador.",
+            )
+
     service_client = get_supabase_client()
     if not service_client:
         raise HTTPException(

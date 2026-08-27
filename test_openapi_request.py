@@ -6,7 +6,7 @@ if r.status_code == 200:
     data = r.json()
     print(f'OpenAPI version: {data.get("openapi")}')
     print(f'Title: {data.get("info", {}).get("title")}')
-    print('✓ OpenAPI schema is valid!')
+    print('OpenAPI schema is valid.')
 else:
     print(f'Error: {r.text[:200]}')
 

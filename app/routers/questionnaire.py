@@ -7,7 +7,8 @@ from ..models import (
     Pregunta, Evaluacion, Respuesta, Resultado, VistaSeudonimizadaML, DerivacionClinica, ProgresoCuestionario, ModeloVersion, AuditoriaModelML
 )
 from ..schemas import QuestionnaireSubmit, SubmitSuccessResponse, ProgresoCreate, ProgresoUpdate, ProgresoResponse, ProgresoDeleteRequest, CuestionarioCompletoSubmit
-from ..security import db_encrypt, db_decrypt
+from ..security import db_encrypt, db_decrypt, get_current_user_optional
+from typing import Optional
 import uuid
 import random
 import hashlib
@@ -210,8 +211,18 @@ async def submit_questionnaire_simple(
             detail=f"Error al crear perfil del estudiante: {str(e)}"
         )
 
-    # 4. Asignar psicólogo activo por defecto
-    psicologo = db.query(Psicologo).filter(Psicologo.activo == True).first()
+    # 4. Asignar psicólogo activo por defecto.
+    # T-008: se reparte por carga (menor cantidad de evaluaciones asignadas)
+    # en vez de tomar siempre el primer psicólogo activo encontrado — evita que
+    # toda la cartera de "pacientes asignados" recaiga sobre un único psicólogo.
+    psicologo = (
+        db.query(Psicologo)
+        .filter(Psicologo.activo == True)
+        .outerjoin(Evaluacion, Evaluacion.id_psicologo == Psicologo.id_psicologo)
+        .group_by(Psicologo.id_psicologo)
+        .order_by(func.count(Evaluacion.id_evaluacion).asc())
+        .first()
+    )
     if not psicologo:
         # No active psicologo — try to create a system one using the student's auth user ID
         # The student's user ID IS valid in auth.users (Supabase) so no FK violation
@@ -386,12 +397,12 @@ async def submit_questionnaire_simple(
         # Notificación a psicólogos activos
         try:
             from ..models import Notificacion
-            titulo = "⚠ Caso Crítico Detectado" if suicide_alert else "🔴 Caso de Riesgo Alto Detectado"
+            titulo = "Caso Crítico Detectado" if suicide_alert else "Caso de Riesgo Alto Detectado"
             mensaje = (
                 f"Se ha detectado un caso con riesgo {risk_level.replace('_', ' ')}. "
                 f"Puntaje PHQ-9: {score}/27. "
                 + (f"Inferencia RandomForest: {ml_prob}% riesgo. " if ml_pred == 1 else "")
-                + ("⚠ ALERTA DE SUICIDIO ACTIVA. " if suicide_alert else "")
+                + ("ALERTA DE SUICIDIO ACTIVA. " if suicide_alert else "")
                 + "Se requiere atención inmediata."
             )
             all_psicologos = db.query(Psicologo).filter(Psicologo.activo == True).all()
@@ -507,10 +518,36 @@ async def submit_questionnaire_simple(
 # AUTO-SAVE & RECOVERY ENDPOINTS (HU0008)
 # ============================================================================
 
+def _progress_owner_id(current_user: Optional[dict]) -> Optional[uuid.UUID]:
+    if not current_user or not current_user.get("id"):
+        return None
+    try:
+        return uuid.UUID(str(current_user["id"]))
+    except ValueError:
+        return None
+
+
+def _assert_progress_access(progress: ProgresoCuestionario, current_user: Optional[dict]) -> None:
+    """
+    T-001: si el progreso ya pertenece a un usuario autenticado, exige que quien
+    llama sea ese mismo usuario. Los progresos anónimos (id_usuario NULL) se
+    mantienen accesibles solo por session_id, igual que antes.
+    """
+    if progress.id_usuario is None:
+        return
+    caller_id = _progress_owner_id(current_user)
+    if caller_id is None or caller_id != progress.id_usuario:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permiso para acceder a este progreso de cuestionario."
+        )
+
+
 @router.post("/progress/save")
 async def save_progress(
     payload: ProgresoCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Save or update questionnaire progress automatically.
@@ -540,6 +577,10 @@ async def save_progress(
         ).first()
 
         if existing_progress:
+            _assert_progress_access(existing_progress, current_user)
+            owner_id = _progress_owner_id(current_user)
+            if owner_id is not None and existing_progress.id_usuario is None:
+                existing_progress.id_usuario = owner_id
             existing_progress.pregunta_actual = payload.pregunta_actual
             existing_progress.respuestas = payload.respuestas
             existing_progress.consentimiento_aceptado = payload.consentimiento_aceptado
@@ -551,6 +592,7 @@ async def save_progress(
         else:
             new_progress = ProgresoCuestionario(
                 session_id=payload.session_id,
+                id_usuario=_progress_owner_id(current_user),
                 id_cuestionario=payload.cuestionario_id,
                 pregunta_actual=payload.pregunta_actual,
                 respuestas=payload.respuestas,
@@ -561,6 +603,8 @@ async def save_progress(
             db.commit()
             db.refresh(new_progress)
             return new_progress
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[MindCheck] Advertencia: No se pudo guardar progreso: {e}")
@@ -571,7 +615,8 @@ async def save_progress(
 @router.get("/progress/recover/{session_id}")
 async def recover_progress(
     session_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Recover questionnaire progress for a given session ID.
@@ -586,13 +631,15 @@ async def recover_progress(
         # Return null/empty instead of 404 to avoid CORS issues on the client
         return None
 
+    _assert_progress_access(progress, current_user)
     return progress
 
 
 @router.delete("/progress/delete", status_code=status.HTTP_200_OK)
 async def delete_progress(
     payload: ProgresoDeleteRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Delete questionnaire progress (used when user voluntarily restarts).
@@ -605,6 +652,8 @@ async def delete_progress(
     if not progress:
         return {"success": True, "message": "No había progreso para esta sesión."}
 
+    _assert_progress_access(progress, current_user)
+
     # Mark as inactive instead of deleting
     progress.activo = False
     db.commit()
@@ -616,7 +665,8 @@ async def delete_progress(
 async def update_progress(
     session_id: str,
     payload: ProgresoUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Update existing questionnaire progress.
@@ -631,6 +681,8 @@ async def update_progress(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No se encontró progreso activo para esta sesión."
         )
+
+    _assert_progress_access(progress, current_user)
 
     progress.pregunta_actual = payload.pregunta_actual
     progress.respuestas = payload.respuestas

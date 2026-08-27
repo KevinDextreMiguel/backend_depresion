@@ -777,11 +777,24 @@ async def update_setting(
 
 @router.get("/ml/audit", response_model=List[AuditoriaModelMLResponse])
 async def get_ml_audits(
+    tipo_evento: Optional[str] = Query(None, description="Filtra por 'entrenamiento' o 'prediccion'"),
+    model_version: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
-    """Obtiene el historial de auditoría de entrenamiento y predicción del modelo ML."""
-    return db.query(AuditoriaModelML).order_by(AuditoriaModelML.fecha_evento.desc()).all()
+    """Obtiene el historial de auditoría de entrenamiento y predicción del modelo ML (HU0045 CA3: filtrable)."""
+    query = db.query(AuditoriaModelML)
+    if tipo_evento:
+        query = query.filter(AuditoriaModelML.tipo_evento == tipo_evento)
+    if model_version:
+        query = query.filter(AuditoriaModelML.model_version == model_version)
+    if start_date:
+        query = query.filter(AuditoriaModelML.fecha_evento >= start_date)
+    if end_date:
+        query = query.filter(AuditoriaModelML.fecha_evento <= end_date)
+    return query.order_by(AuditoriaModelML.fecha_evento.desc()).all()
 
 
 @router.get("/ml/metrics", response_model=List[MLModelMetricsDetail])
@@ -801,23 +814,25 @@ async def get_ml_metrics(
         ).order_by(AuditoriaModelML.fecha_evento.desc()).first()
 
         if audit and audit.precision is not None:
+            # T-005: solo se reportan métricas reales, provenientes de un evento
+            # de entrenamiento auditado. Antes, si no existía ese registro, se
+            # inventaban valores deterministas por hash(model.version) y se
+            # mostraban como si fueran precisión/recall reales — eliminado.
             precision = float(audit.precision)
             recall = float(audit.recall)
             f1_score = float(audit.f1_score)
             accuracy = float(audit.accuracy)
+            is_simulated = False
         else:
-            # Seed metrics dynamically per model version or provide defaults
-            factor = float(hash(model.version) % 10) / 100.0 # small deterministic variance
-            precision = float(round(0.85 + factor * 0.05, 4))
-            recall = float(round(0.82 + factor * 0.06, 4))
-            f1_score = float(round(2 * (precision * recall) / (precision + recall), 4))
-            accuracy = float(round(0.88 + factor * 0.04, 4))
-        
+            precision = recall = f1_score = accuracy = None
+            is_simulated = True
+
         # Count training seudonimized records available at publication date
+        # (conteo real, sin piso artificial — 0 es un valor válido y honesto).
         cnt = db.query(func.count(VistaSeudonimizadaML.id_registro)).filter(
             VistaSeudonimizadaML.fecha_generacion <= model.fecha_publicacion
         ).scalar() or 0
-        
+
         result.append(
             MLModelMetricsDetail(
                 version=model.version,
@@ -827,7 +842,8 @@ async def get_ml_metrics(
                 recall=recall,
                 f1_score=f1_score,
                 accuracy=accuracy,
-                training_samples=max(10, cnt)
+                training_samples=cnt,
+                is_simulated=is_simulated,
             )
         )
         

@@ -239,6 +239,7 @@ COMMENT ON COLUMN vista_seudonimizada_ml.note IS 'Vista seudonimizada derivada d
 CREATE TABLE progreso_cuestionario (
     id_progreso uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id VARCHAR(255) NOT NULL UNIQUE,
+    id_usuario uuid NULL,
     id_cuestionario uuid NOT NULL REFERENCES cuestionario(id_cuestionario) ON DELETE CASCADE,
     pregunta_actual INTEGER NOT NULL DEFAULT 0,
     respuestas JSON NOT NULL,
