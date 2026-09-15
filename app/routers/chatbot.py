@@ -1,13 +1,19 @@
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import ChatbotRespuesta
-from ..schemas import ChatbotResponse, ChatbotResponseCreate, ChatbotResponseUpdate
-from ..security import require_role
+from ..models import ChatbotRespuesta, ChatbotInteraccion
+from ..schemas import (
+    ChatbotResponse,
+    ChatbotResponseCreate,
+    ChatbotResponseUpdate,
+    ChatbotInteractionCreate,
+    ChatbotInteractionResponse,
+)
+from ..security import require_role, get_current_user_optional
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
@@ -93,3 +99,26 @@ async def delete_chatbot_response(
     db.add(chatbot_response)
     db.commit()
     return
+
+
+@router.post("/interactions", response_model=ChatbotInteractionResponse, status_code=status.HTTP_201_CREATED)
+async def register_chatbot_interaction(
+    payload: ChatbotInteractionCreate,
+    current_user: Optional[dict] = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    """
+    Registra una interacción del chatbot (HU0016). Cada vez que el frontend
+    obtiene una respuesta para el usuario, reporta si hubo match (resuelta)
+    o cayó en fallback off-topic, para poder calcular métricas de desempeño.
+    """
+    interaction = ChatbotInteraccion(
+        pregunta=payload.pregunta,
+        resuelta=payload.resuelta,
+        clave_respuesta=payload.clave_respuesta,
+        id_usuario=UUID(current_user["id"]) if current_user else None,
+    )
+    db.add(interaction)
+    db.commit()
+    db.refresh(interaction)
+    return interaction

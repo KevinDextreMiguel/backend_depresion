@@ -14,14 +14,15 @@ from ..models import (
     Usuario, Estudiante, Psicologo, Consentimiento, Cuestionario,
     Pregunta, Evaluacion, Respuesta, Resultado, VistaSeudonimizadaML,
     DerivacionClinica, Intervencion, AuditoriaAcceso, TerminosAceptacion,
-    ConfiguracionSistema, AuditoriaModelML, ModeloVersion
+    ConfiguracionSistema, AuditoriaModelML, ModeloVersion, PoliticaVersionHistorial
 )
 from ..schemas import (
     TerminosStatusResponse, TerminosAcceptRequest, ConsentStatusResponse,
     ConsentAcceptRequest, UserConsentHistoryItem, ConfiguracionResponse,
     ConfiguracionUpdate, KPIsDashboardResponse, RiskDistributionDetail,
     TrendsAdvancedResponse, TrendPoint, InterventionEffectivenessItem,
-    LiveMonitoringItem, AuditoriaModelMLResponse, MLModelMetricsDetail
+    LiveMonitoringItem, AuditoriaModelMLResponse, MLModelMetricsDetail,
+    PoliticaVersionHistorialItem
 )
 from ..security import require_role, get_current_user, db_decrypt
 
@@ -623,15 +624,15 @@ async def export_pdf(
 
 
 # ============================================================================
-# HU0039: RESEARCHER ACCESS TO ANONYMIZED DATASETS
+# Acceso a datasets anonimizados para análisis (exportación admin)
 # ============================================================================
 
 @router.get("/researcher/dataset")
 async def get_anonymized_dataset(
-    current_user: dict = Depends(require_role(["admin", "investigador"])),
+    current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
-    """Entrega información seudonimizada sin identificadores personales para investigación."""
+    """Entrega información seudonimizada sin identificadores personales para análisis."""
     # We fetch records directly from the VistaSeudonimizadaML table
     records = db.query(VistaSeudonimizadaML).all()
     
@@ -659,7 +660,7 @@ async def get_anonymized_dataset(
         tabla_objetivo="vista_seudonimizada_ml",
         id_objetivo=uuid.uuid4(),
         ip_origen=client_ip,
-        detalle=f"Investigador {current_user.get('email')} descargó dataset de investigación conteniendo {len(records)} registros."
+        detalle=f"Administrador {current_user.get('email')} descargó dataset anonimizado conteniendo {len(records)} registros."
     )
     db.add(audit)
     db.commit()
@@ -750,10 +751,10 @@ async def update_setting(
     config.valor = payload.valor
     if payload.descripcion is not None:
         config.descripcion = payload.descripcion
-        
+
     db.commit()
     db.refresh(config)
-    
+
     # Audit log (HU0043 CA2)
     client_ip = request.client.host if request.client else "127.0.0.1"
     admin_id = uuid.UUID(current_user["id"])
@@ -767,8 +768,60 @@ async def update_setting(
     )
     db.add(audit)
     db.commit()
+
+    # HU0031 CA2: si se publica una nueva versión/contenido de T&C, conservar
+    # el historial de versiones y fechas en vez de solo sobreescribir el valor
+    # vigente en configuracion_sistema.
+    if config.clave in ("tc_version", "tc_content") and old_value != payload.valor:
+        current_version = get_system_config(db, "tc_version", "1.0")
+        current_content = get_system_config(db, "tc_content", "")
+        history_row = PoliticaVersionHistorial(
+            clave=config.clave,
+            version=current_version if config.clave != "tc_version" else payload.valor,
+            contenido=current_content if config.clave != "tc_content" else payload.valor,
+            publicado_por=admin_id,
+        )
+        db.add(history_row)
+        db.commit()
     
     return config
+
+
+@router.get("/tc-versions", response_model=List[PoliticaVersionHistorialItem])
+async def get_tc_versions(
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
+    """
+    HU0031 CA2: historial de versiones publicadas de los Términos y
+    Condiciones (versión, contenido, fecha y quién la publicó), ordenado de
+    la más reciente a la más antigua.
+    """
+    rows = (
+        db.query(PoliticaVersionHistorial)
+        .filter(PoliticaVersionHistorial.clave.in_(["tc_version", "tc_content"]))
+        .order_by(PoliticaVersionHistorial.fecha_publicacion.desc())
+        .all()
+    )
+    results = []
+    for row in rows:
+        publicado_por_nombre = None
+        if row.publicado_por:
+            user = db.query(Usuario).filter(Usuario.id_usuario == row.publicado_por).first()
+            if user:
+                publicado_por_nombre = user.nombre or user.correo
+        results.append(
+            PoliticaVersionHistorialItem(
+                id_version=row.id_version,
+                clave=row.clave,
+                version=row.version,
+                contenido=row.contenido,
+                publicado_por=row.publicado_por,
+                publicado_por_nombre=publicado_por_nombre,
+                fecha_publicacion=row.fecha_publicacion,
+            )
+        )
+    return results
 
 
 # ============================================================================

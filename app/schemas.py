@@ -10,11 +10,11 @@ class PyModel(BaseModel):
 
 # T-003: catálogo cerrado de roles — evita que cualquier string arbitrario
 # (enviado por un cliente no autenticado) se persista como rol del sistema.
-UserRole = Literal["estudiante", "psicologo", "admin", "investigador"]
+UserRole = Literal["estudiante", "psicologo", "admin"]
 
 # --- Authentication & User Profiles ---
 class UserBase(PyModel):
-    rol: UserRole = Field(..., description="Role: admin, psicologo, estudiante, investigador")
+    rol: UserRole = Field(..., description="Role: admin, psicologo, estudiante")
 
 class UserCreate(UserBase):
     email: EmailStr
@@ -22,7 +22,7 @@ class UserCreate(UserBase):
     nombre: str
     admin_invite_code: Optional[str] = Field(
         None,
-        description="Requerido únicamente para autoregistrarse con un rol privilegiado (admin, psicologo, investigador).",
+        description="Requerido únicamente para autoregistrarse con un rol privilegiado (admin, psicologo).",
     )
 
 class UserLogin(BaseModel):
@@ -67,7 +67,7 @@ class UserUpdateProfile(BaseModel):
     universidad: Optional[str] = Field(None, description="Universidad del estudiante")
 
 class UserUpdateRequest(BaseModel):
-    rol: Optional[UserRole] = Field(None, description="Nuevo rol del usuario: admin, psicologo, estudiante, investigador")
+    rol: Optional[UserRole] = Field(None, description="Nuevo rol del usuario: admin, psicologo, estudiante")
     activo: Optional[bool] = Field(None, description="Estado de acceso del usuario")
 
 # --- Roles Schema Extensions ---
@@ -206,6 +206,44 @@ class ChatbotResponse(PyModel):
     id_creador: Optional[UUID] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+# --- Chatbot Interactions / Performance (HU0016) ---
+class ChatbotInteractionCreate(PyModel):
+    pregunta: str = Field(..., description="Texto de la pregunta/mensaje del usuario")
+    resuelta: bool = Field(..., description="True si hubo match con una respuesta configurada")
+    clave_respuesta: Optional[str] = Field(None, description="Clave de la respuesta que resolvió la consulta, si aplica")
+
+class ChatbotInteractionResponse(PyModel):
+    id_interaccion: UUID
+    pregunta: str
+    resuelta: bool
+    clave_respuesta: Optional[str] = None
+    id_usuario: Optional[UUID] = None
+    created_at: datetime
+
+class ChatbotMetricsResponse(PyModel):
+    total_interacciones: int
+    resueltas: int
+    no_resueltas: int
+    tasa_resolucion: float
+    incidencias: List[ChatbotInteractionResponse]
+
+# --- System Audit (HU0043 CA3) ---
+class AuditLogResponse(PyModel):
+    id_auditoria: UUID
+    id_usuario: UUID
+    accion: str
+    tabla_objetivo: str
+    id_objetivo: UUID
+    fecha_evento: datetime
+    ip_origen: Optional[str] = None
+    detalle: Optional[str] = None
+    usuario_email: Optional[str] = None
+    usuario_nombre: Optional[str] = None
+
+class AuditLogListResponse(PyModel):
+    total: int
+    items: List[AuditLogResponse]
 
 # --- Clinical Derivation ---
 class DerivacionCreate(PyModel):
@@ -503,6 +541,15 @@ class ConfiguracionResponse(PyModel):
 class ConfiguracionUpdate(BaseModel):
     valor: str
     descripcion: Optional[str] = None
+
+class PoliticaVersionHistorialItem(PyModel):
+    id_version: UUID
+    clave: str
+    version: str
+    contenido: Optional[str] = None
+    publicado_por: Optional[UUID] = None
+    publicado_por_nombre: Optional[str] = None
+    fecha_publicacion: datetime
 
 class RiskDistributionDetail(BaseModel):
     minimal: int

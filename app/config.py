@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     AUTH_MODE: str = os.getenv("AUTH_MODE", "local")
 
     # T-003: código requerido para autoregistrarse con un rol privilegiado
-    # (admin, psicologo, investigador). Sin este código configurado, el registro
+    # (admin, psicologo). Sin este código configurado, el registro
     # de esos roles queda deshabilitado y solo un admin existente puede asignarlos
     # vía PUT /admin/users/{id}.
     ADMIN_SIGNUP_CODE: str = os.getenv("ADMIN_SIGNUP_CODE", "")

@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract, cast, String
 from datetime import datetime, timedelta
 from uuid import UUID
 from typing import List
+import io
 from ..database import get_db
-from ..models import Evaluacion, Resultado, Respuesta, Estudiante, DerivacionClinica, Usuario, AuditoriaAcceso, ModeloVersion, VistaSeudonimizadaML, ObservacionSeguimiento, Psicologo, Cita, Intervencion, Notificacion, AuditoriaModelML
+from ..models import Evaluacion, Resultado, Respuesta, Estudiante, DerivacionClinica, Usuario, AuditoriaAcceso, ModeloVersion, VistaSeudonimizadaML, ObservacionSeguimiento, Psicologo, Cita, Intervencion, Notificacion, AuditoriaModelML, ChatbotInteraccion
 from ..schemas import (
     StatisticsResponse,
     RiskDistribution,
@@ -28,6 +30,10 @@ from ..schemas import (
     NotificacionMarkRevisada,
     ObservacionResponse,
     StudentEvolutionItem,
+    ChatbotMetricsResponse,
+    ChatbotInteractionResponse,
+    AuditLogResponse,
+    AuditLogListResponse,
 )
 from ..security import require_role, get_supabase_client
 
@@ -282,6 +288,114 @@ async def get_student_history(
     return results
 
 
+@router.get("/student-history/{anon_student_id}/export/pdf")
+async def export_student_history_pdf(
+    anon_student_id: str,
+    current_user: dict = Depends(require_role(["admin", "psicologo"])),
+    db: Session = Depends(get_db),
+):
+    """
+    HU0028: exporta el reporte individual de evaluación de un estudiante
+    (historial, evolución y observaciones) en PDF descargable. Disponible
+    para admin y para el psicólogo que tenga asignado al estudiante
+    (reutiliza el mismo control de alcance que /student-history).
+    """
+    history = await get_student_history(anon_student_id, current_user, db)
+    if not history:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El estudiante no tiene evaluaciones registradas")
+
+    student_label = history[0].id_anonimo
+
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+
+        pdf_buffer = io.BytesIO()
+        doc = SimpleDocTemplate(pdf_buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+        story = []
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'ReportTitle', parent=styles['Heading1'], fontSize=20, leading=24,
+            textColor=colors.HexColor('#1E293B'), spaceAfter=12,
+        )
+        subtitle_style = ParagraphStyle(
+            'ReportSubtitle', parent=styles['Normal'], fontSize=10,
+            textColor=colors.HexColor('#64748B'), spaceAfter=16,
+        )
+        section_style = ParagraphStyle(
+            'SectionTitle', parent=styles['Heading2'], fontSize=13,
+            textColor=colors.HexColor('#1E293B'), spaceBefore=14, spaceAfter=6,
+        )
+        body_style = styles['Normal']
+
+        story.append(Paragraph(f"MindCheck - Reporte Individual del Estudiante {student_label}", title_style))
+        story.append(Paragraph(
+            f"Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Carrera: {history[0].carrera} | Universidad: {history[0].universidad}",
+            subtitle_style,
+        ))
+
+        story.append(Paragraph("Historial y evolución de evaluaciones", section_style))
+        table_data = [["Fecha", "Nivel de Riesgo", "Puntaje PHQ-9", "Alerta", "Estado"]]
+        for item in history:
+            table_data.append([
+                item.fecha.strftime("%Y-%m-%d") if item.fecha else "",
+                item.nivel_riesgo,
+                str(item.puntaje),
+                "CRITICO" if item.alerta_suicidio else "Normal",
+                item.estado_evaluacion or "",
+            ])
+        t = Table(table_data, colWidths=[90, 130, 90, 80, 90])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4A90E2')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#FFFFFF'), colors.HexColor('#F1F5F9')]),
+        ]))
+        story.append(t)
+
+        story.append(Paragraph("Observaciones de seguimiento", section_style))
+        any_obs = False
+        for item in history:
+            for obs in (item.observaciones or []):
+                any_obs = True
+                fecha_obs = obs.created_at.strftime("%Y-%m-%d %H:%M") if obs.created_at else ""
+                story.append(Paragraph(f"<b>{fecha_obs}</b> — {obs.texto or ''}", body_style))
+                story.append(Spacer(1, 4))
+        if not any_obs:
+            story.append(Paragraph("Sin observaciones registradas.", body_style))
+
+        doc.build(story)
+        pdf_buffer.seek(0)
+        filename = f"reporte_{student_label.lstrip('#')}.pdf"
+        return StreamingResponse(
+            pdf_buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except ImportError:
+        # Fallback si reportlab no está disponible: reporte de texto plano.
+        output = io.StringIO()
+        output.write(f"MindCheck - Reporte Individual del Estudiante {student_label}\n")
+        output.write(f"Generado el: {datetime.now().isoformat()}\n\n")
+        output.write(f"{'FECHA':<20}{'RIESGO':<25}{'PUNTAJE':<10}{'ALERTA'}\n")
+        for item in history:
+            fecha_str = item.fecha.strftime('%Y-%m-%d %H:%M') if item.fecha else ""
+            output.write(f"{fecha_str:<20}{item.nivel_riesgo:<25}{item.puntaje:<10}{'SI' if item.alerta_suicidio else 'NO'}\n")
+        buffer = io.BytesIO(output.getvalue().encode("utf-8"))
+        return StreamingResponse(
+            buffer,
+            media_type="text/plain",
+            headers={"Content-Disposition": f"attachment; filename=reporte_{student_label.lstrip('#')}.txt"},
+        )
+
+
 @router.get("/assigned-patients", response_model=list[AssignedPatientItem])
 async def get_assigned_patients(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -447,7 +561,10 @@ async def create_appointment(
         ap_start = ap.fecha_inicio
         ap_end = ap.fecha_inicio + timedelta(minutes=ap.duracion_minutos)
         if not (end <= ap_start or start >= ap_end):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Horario no disponible para el psicólogo")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Ese horario ya está ocupado para el psicólogo. Por favor selecciona otro horario.",
+            )
 
     new = Cita(
         id_psicologo=psicologo_id,
@@ -1277,3 +1394,125 @@ async def mark_notification_revisada(
         universidad=universidad,
         puntaje=puntaje,
     )
+
+
+# --- Chatbot Performance Monitoring (HU0016) ---
+
+@router.get("/chatbot/metrics", response_model=ChatbotMetricsResponse)
+async def get_chatbot_metrics(
+    limit_incidencias: int = Query(50, ge=1, le=500),
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db),
+):
+    """
+    Indicadores clave de desempeño del chatbot (HU0016 CA1/CA2/CA3):
+    total de interacciones registradas, tasa de resolución (% de consultas
+    que tuvieron match con una respuesta configurada) y lista de las
+    interacciones no resueltas (incidencias/fallback) más recientes.
+    """
+    total = db.query(func.count(ChatbotInteraccion.id_interaccion)).scalar() or 0
+    resueltas = db.query(func.count(ChatbotInteraccion.id_interaccion)).filter(
+        ChatbotInteraccion.resuelta.is_(True)
+    ).scalar() or 0
+    no_resueltas = total - resueltas
+    tasa = (resueltas / total * 100.0) if total > 0 else 0.0
+
+    incidencias = (
+        db.query(ChatbotInteraccion)
+        .filter(ChatbotInteraccion.resuelta.is_(False))
+        .order_by(ChatbotInteraccion.created_at.desc())
+        .limit(limit_incidencias)
+        .all()
+    )
+
+    return ChatbotMetricsResponse(
+        total_interacciones=total,
+        resueltas=resueltas,
+        no_resueltas=no_resueltas,
+        tasa_resolucion=round(tasa, 2),
+        incidencias=incidencias,
+    )
+
+
+@router.get("/chatbot/interactions", response_model=List[ChatbotInteractionResponse])
+async def list_chatbot_interactions(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    resuelta: bool | None = Query(None, description="Filtra por resuelta/no resuelta"),
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db),
+):
+    """
+    Lista las interacciones del chatbot registradas, para exportación/reporte
+    de desempeño (HU0016 CA4).
+    """
+    query = db.query(ChatbotInteraccion)
+    if resuelta is not None:
+        query = query.filter(ChatbotInteraccion.resuelta.is_(resuelta))
+    interactions = (
+        query.order_by(ChatbotInteraccion.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return interactions
+
+
+# --- System Audit Log (HU0043 CA3) ---
+
+@router.get("/audit", response_model=AuditLogListResponse)
+async def get_audit_log(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    id_usuario: UUID | None = Query(None, description="Filtra por usuario"),
+    accion: str | None = Query(None, description="Filtra por tipo de acción (coincidencia exacta o parcial)"),
+    tabla_objetivo: str | None = Query(None, description="Filtra por tabla afectada"),
+    fecha_desde: datetime | None = Query(None, description="Filtra eventos desde esta fecha (inclusive)"),
+    fecha_hasta: datetime | None = Query(None, description="Filtra eventos hasta esta fecha (inclusive)"),
+    current_user: dict = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db),
+):
+    """
+    Consulta el historial de auditoría de accesos y cambios del sistema
+    (HU0043 CA3), con filtros opcionales y paginación.
+    """
+    query = db.query(AuditoriaAcceso)
+
+    if id_usuario is not None:
+        query = query.filter(AuditoriaAcceso.id_usuario == id_usuario)
+    if accion:
+        query = query.filter(AuditoriaAcceso.accion.ilike(f"%{accion}%"))
+    if tabla_objetivo:
+        query = query.filter(AuditoriaAcceso.tabla_objetivo.ilike(f"%{tabla_objetivo}%"))
+    if fecha_desde is not None:
+        query = query.filter(AuditoriaAcceso.fecha_evento >= fecha_desde)
+    if fecha_hasta is not None:
+        query = query.filter(AuditoriaAcceso.fecha_evento <= fecha_hasta)
+
+    total = query.count()
+    rows = (
+        query.order_by(AuditoriaAcceso.fecha_evento.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    items: List[AuditLogResponse] = []
+    for row in rows:
+        usuario = db.query(Usuario).filter(Usuario.id_usuario == row.id_usuario).first()
+        items.append(
+            AuditLogResponse(
+                id_auditoria=row.id_auditoria,
+                id_usuario=row.id_usuario,
+                accion=row.accion,
+                tabla_objetivo=row.tabla_objetivo,
+                id_objetivo=row.id_objetivo,
+                fecha_evento=row.fecha_evento,
+                ip_origen=row.ip_origen,
+                detalle=row.detalle,
+                usuario_email=usuario.email if usuario else None,
+                usuario_nombre=getattr(usuario, "nombre", None) if usuario else None,
+            )
+        )
+
+    return AuditLogListResponse(total=total, items=items)

@@ -158,7 +158,7 @@ async def reset_password(request: ResetPasswordRequest):
 async def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
     """Registro usando Supabase Auth admin.create_user (auto-confirma email)."""
     # T-003: el autoregistro público solo puede crear cuentas de estudiante.
-    # Un rol privilegiado (admin/psicologo/investigador) requiere el código de
+    # Un rol privilegiado (admin/psicologo) requiere el código de
     # invitación configurado en el servidor — si no está configurado, ese rol
     # queda inalcanzable por este endpoint público, y solo un admin existente
     # puede asignarlo vía PUT /admin/users/{id}.

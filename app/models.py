@@ -281,6 +281,19 @@ class ChatbotRespuesta(Base):
     creador = relationship("Usuario")
 
 
+class ChatbotInteraccion(Base):
+    __tablename__ = "chatbot_interaccion"
+
+    id_interaccion = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pregunta = Column(String, nullable=False)
+    resuelta = Column(Boolean, nullable=False, default=False)
+    clave_respuesta = Column(String(120), nullable=True)
+    id_usuario = Column(UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    usuario = relationship("Usuario")
+
+
 class VistaSeudonimizadaML(Base):
     __tablename__ = "vista_seudonimizada_ml"
 
@@ -410,6 +423,22 @@ class TerminosAceptacion(Base):
     fecha_aceptacion = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     ip_origen = Column(String(45), nullable=False)
     aceptado = Column(Boolean, nullable=False, default=True)
+
+
+class PoliticaVersionHistorial(Base):
+    """
+    HU0031 CA2: historial de versiones publicadas de políticas/T&C. Cada
+    publicación de una nueva versión inserta una fila nueva en vez de
+    sobreescribir, conservando versión, contenido, fecha y quién la publicó.
+    """
+    __tablename__ = "politica_version_historial"
+
+    id_version = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    clave = Column(String(100), nullable=False)  # p.ej. "tc_version"
+    version = Column(String(50), nullable=False)
+    contenido = Column(String, nullable=True)
+    publicado_por = Column(UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="SET NULL"), nullable=True)
+    fecha_publicacion = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ConfiguracionSistema(Base):
