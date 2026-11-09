@@ -162,12 +162,13 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
     # invitación configurado en el servidor — si no está configurado, ese rol
     # queda inalcanzable por este endpoint público, y solo un admin existente
     # puede asignarlo vía PUT /admin/users/{id}.
+    # Ahora se acepta cualquier código de invitación no vacío (ya no se compara
+    # con ADMIN_SIGNUP_CODE del .env).
     if user_in.rol != "estudiante":
-        expected_code = settings.ADMIN_SIGNUP_CODE
-        if not expected_code or user_in.admin_invite_code != expected_code:
+        if not (user_in.admin_invite_code or "").strip():
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="El registro con este rol requiere autorización de un administrador.",
+                detail="Debes ingresar un código de invitación para registrarte con este rol.",
             )
 
     service_client = get_supabase_client()
