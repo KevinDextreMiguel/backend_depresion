@@ -28,13 +28,19 @@ async def submit_questionnaire_simple(
 ):
     """
     Recibe el cuestionario completo del estudiante (demografía, hábitos, MSPSS y PHQ-9).
-    Calcula scores clínicos, ejecuta la inferencia en tiempo real con el modelo RandomForest
-    y registra los resultados en la base de datos de manera atómica.
+    Calcula scores clínicos, ejecuta la inferencia en tiempo real con la Logistic Regression
+    del paper (sueño + calidad de sueño + MSPSS 1-7) y registra los resultados en la base de datos de manera atómica.
     """
     if not payload.consentimiento_aceptado:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Se requiere la aceptación del consentimiento informado para continuar."
+        )
+
+    if not all(1 <= v <= 7 for v in payload.mspss_respuestas):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Las respuestas MSPSS deben estar en la escala 1 a 7."
         )
 
     # 1. Obtener o crear el cuestionario PHQ-9 por defecto
@@ -305,17 +311,17 @@ async def submit_questionnaire_simple(
             detail=f"Error al guardar respuestas PHQ-9: {str(resp_err)}"
         )
 
-    # 7. Calcular score de MSPSS total
+    # 7. Calcular score de MSPSS (escala 1-7): total y media de los 12 ítems
     mspss_total = sum(payload.mspss_respuestas)
+    mspss_mean = round(mspss_total / 12.0, 4)
 
-    # 8. Inferencia en tiempo real con el modelo de Machine Learning (RandomForest Bloque B)
+    # 8. Inferencia en tiempo real con el modelo del paper (Logistic Regression, NB01)
     try:
         from ..utils.ml_model import predict_depression_risk
-        ml_pred, ml_prob = predict_depression_risk(
+        ml_pred, ml_prob, mspss_mean = predict_depression_risk(
             horas_sueno=payload.horas_sueno,
-            mspss_total=mspss_total,
-            historia_salud_mental=payload.historia_salud_mental,
-            calidad_sueno=payload.calidad_sueno
+            calidad_sueno=payload.calidad_sueno,
+            mspss_respuestas=payload.mspss_respuestas,
         )
         print(f"[MindCheck] Inferencia ML OK: pred={ml_pred}, prob={ml_prob}", flush=True)
     except Exception as ml_err:
@@ -357,6 +363,7 @@ async def submit_questionnaire_simple(
                 "ml_probability": ml_prob,
                 "horas_sueno": payload.horas_sueno,
                 "mspss_total": mspss_total,
+                "mspss_mean": mspss_mean,
                 "calidad_sueno": payload.calidad_sueno,
                 "historia_salud_mental": payload.historia_salud_mental
             },
@@ -401,7 +408,7 @@ async def submit_questionnaire_simple(
             mensaje = (
                 f"Se ha detectado un caso con riesgo {risk_level.replace('_', ' ')}. "
                 f"Puntaje PHQ-9: {score}/27. "
-                + (f"Inferencia RandomForest: {ml_prob}% riesgo. " if ml_pred == 1 else "")
+                + (f"Inferencia Logistic Regression: {ml_prob}% riesgo. " if ml_pred == 1 else "")
                 + ("ALERTA DE SUICIDIO ACTIVA. " if suicide_alert else "")
                 + "Se requiere atención inmediata."
             )
@@ -443,7 +450,7 @@ async def submit_questionnaire_simple(
     # 11. Auditoría de Inferencia ML en AuditoriaModelML
     try:
         current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
-        model_ver_str = f"{current_model.nombre} v{current_model.version}" if current_model else "RandomForest v1.0"
+        model_ver_str = f"{current_model.nombre} v{current_model.version}" if current_model else "LogisticRegression v1.0"
         
         audit_pred = AuditoriaModelML(
             tipo_evento="prediccion",
@@ -467,7 +474,9 @@ async def submit_questionnaire_simple(
         carrera_area = "Ingenierías" if "Ingeniería" in db_student.carrera else "Ciencias de la Salud" if db_student.carrera in ["Medicina", "Psicología"] else "Humanidades y Negocios"
         
         current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
-        origin_model = f"{current_model.nombre} v{current_model.version}" if current_model else "RandomForest v1.0"
+        # El prefijo "LogisticRegression" marca registros con MSPSS 1-7 (reutilizables para reentrenar).
+        from ..utils.ml_model import PRIMARY_MODEL_NAME
+        origin_model = f"{PRIMARY_MODEL_NAME} v{current_model.version}" if current_model else f"{PRIMARY_MODEL_NAME} v1.0"
 
         db_ml = VistaSeudonimizadaML(
             id_registro=uuid.uuid4(),
@@ -489,7 +498,7 @@ async def submit_questionnaire_simple(
             q9=payload.phq9_respuestas[8],
             prediction="riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
             origen_modelo=origin_model,
-            note=f"Inferencia en tiempo real (RF). Probabilidad: {ml_prob}%.",
+            note=f"Inferencia en tiempo real (LR paper). Probabilidad: {ml_prob}%.",
             horas_sueno=payload.horas_sueno,
             calidad_sueno=payload.calidad_sueno,
             historia_salud_mental=payload.historia_salud_mental,

@@ -153,7 +153,7 @@ class CuestionarioCompletoSubmit(BaseModel):
     historia_salud_mental: str = Field(..., description="Antecedentes: Nunca, Previo no actual, Actual, Prefiero no responder")
 
     # Respuestas de escalas
-    mspss_respuestas: List[int] = Field(..., min_items=12, max_items=12, description="Exactamente 12 respuestas de la escala MSPSS (valores 1 a 4)")
+    mspss_respuestas: List[int] = Field(..., min_items=12, max_items=12, description="Exactamente 12 respuestas de la escala MSPSS (valores 1 a 7)")
     phq9_respuestas: List[int] = Field(..., min_items=9, max_items=9, description="Exactamente 9 respuestas del PHQ-9 (valores 0 a 3)")
     
     consentimiento_aceptado: bool = Field(..., description="Debe ser True para procesar el tamizaje")
@@ -380,6 +380,9 @@ class ModelPerformance(BaseModel):
     precision: float
     recall: float
     f1_score: float
+    roc_auc: Optional[float] = None
+    average_precision: Optional[float] = None
+    brier: Optional[float] = None
     is_winner: bool
 
 class ModelRetrainResponse(BaseModel):

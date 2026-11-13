@@ -961,6 +961,9 @@ async def retrain_model(
             "precision": r["precision"],
             "recall": r["recall"],
             "f1_score": r["f1_score"],
+            "roc_auc": r.get("roc_auc"),
+            "average_precision": r.get("average_precision"),
+            "brier": r.get("brier"),
             "is_winner": r["is_winner"]
         })
 

@@ -1,258 +1,332 @@
+"""
+Modelo de discriminación concurrente de PHQ-9 >= 10 (paper_notebook / NB01).
+
+Diseño (idéntico a NB01_Modelado_Discriminacion):
+- Outcome: PHQ-9 >= 10.
+- Predictores fijados a priori: sleep_hours, sleep_quality (1-5), mspss_mean (1-7).
+- Modelo primario (desplegado): Logistic Regression L2, imputación por mediana + StandardScaler.
+  C se ajusta por GridSearchCV (5-fold estratificado, scoring ROC-AUC).
+- Comparador secundario (solo reporte): Random Forest.
+- Evaluación: nested 5-fold CV con predicciones OOF; métricas ROC-AUC, AP y Brier.
+- Datos: snapshot analítico P1-P4 (MSPSS 1-7). P5 (MSPSS 1-4) no se usa.
+
+El modelo NO es un instrumento diagnóstico; la probabilidad es una salida de tamizaje.
+"""
+
+import json
 import os
+
 import joblib
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, RobustScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import AdaBoostClassifier
-from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-# Configuración del modelo y reproducibilidad
-SEED_GLOBAL = 42
-MODEL_FILENAME = "modelo_entrenado.joblib"
-MODEL_PATH = os.path.join(os.path.dirname(__file__), MODEL_FILENAME)
-DATASET_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "data_depresion.xlsx"))
+# ---------------------------------------------------------------------------
+# Configuración (NB01)
+# ---------------------------------------------------------------------------
+SEED = 42
+N_OUTER = 5
+N_INNER = 5
 
-# Definición de variables del Bloque B
-COLS_NUM = ["horas_sueno", "mspss_total"]
-COLS_NOM = ["historia_salud_mental"]
-COLS_ORD = ["calidad_sueno"]
+PRIMARY_MODEL_NAME = "LogisticRegression"
+COMPARATOR_MODEL_NAME = "RandomForest"
 
-ORDEN_SUENIO = ["Muy mala", "Mala", "Regular", "Buena", "Muy buena"]
+FEATURES = ["sleep_hours", "sleep_quality", "mspss_mean"]
+TARGET = "phq9_positive"
+PHQ9_CUTOFF = 10
 
-def make_preprocessor():
-    """Construye el ColumnTransformer de preprocesamiento de scikit-learn."""
-    num_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler',  RobustScaler()),
+# Umbral de clasificación por defecto de predict(). El paper no define un punto
+# operativo; la salida principal es la probabilidad.
+DECISION_THRESHOLD = 0.5
+
+SLEEP_QUALITY_MAP = {
+    "muy mala": 1,
+    "mala": 2,
+    "regular": 3,
+    "buena": 4,
+    "muy buena": 5,
+}
+
+UTILS_DIR = os.path.dirname(__file__)
+MODEL_FILENAME = "modelo_paper_lr.joblib"
+MODEL_PATH = os.path.join(UTILS_DIR, MODEL_FILENAME)
+DATASET_PATH = os.path.join(UTILS_DIR, "data", "nb01_analytic_dataset.csv")
+DATASET_SHA256 = "d217f5b7951468d8e6699e9fd95f8a5acc79117627430da5ee670954443e2a16"
+
+
+# ---------------------------------------------------------------------------
+# Pipelines
+# ---------------------------------------------------------------------------
+def make_lr_pipeline():
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        # Regularización L2 (default de sklearn; `penalty=` está deprecado desde 1.8).
+        ("classifier", LogisticRegression(
+            solver="lbfgs",
+            max_iter=2000,
+            class_weight=None,
+            random_state=SEED,
+        )),
     ])
 
-    cat_nom_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('onehot',  OneHotEncoder(drop='if_binary', sparse_output=False, handle_unknown='ignore')),
+
+def make_rf_pipeline():
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("classifier", RandomForestClassifier(
+            n_estimators=500,
+            class_weight=None,
+            random_state=SEED,
+            n_jobs=1,
+        )),
     ])
 
-    cat_ord_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('ordinal', OrdinalEncoder(categories=[ORDEN_SUENIO],
-                                   handle_unknown='use_encoded_value',
-                                   unknown_value=-1)),
-    ])
 
-    preprocessor = ColumnTransformer([
-        ('num', num_pipeline, COLS_NUM),
-        ('cat_nom', cat_nom_pipeline, COLS_NOM),
-        ('cat_ord', cat_ord_pipeline, COLS_ORD),
-    ])
-    
-    return preprocessor
+MODEL_SPECS = {
+    PRIMARY_MODEL_NAME: {
+        "make_pipeline": make_lr_pipeline,
+        "grid": {"classifier__C": [0.01, 0.1, 1.0, 10.0, 100.0]},
+    },
+    COMPARATOR_MODEL_NAME: {
+        "make_pipeline": make_rf_pipeline,
+        "grid": {
+            "classifier__max_depth": [3, 5, None],
+            "classifier__min_samples_leaf": [3, 5, 10],
+            "classifier__max_features": ["sqrt", 1.0],
+        },
+    },
+}
 
-def get_initial_dataset(db=None):
-    """Carga el dataset desde la tabla de base de datos vista_seudonimizada_ml."""
-    from ..database import SessionLocal
-    local_session = False
+
+def _grid_search(spec, inner_seed):
+    return GridSearchCV(
+        estimator=spec["make_pipeline"](),
+        param_grid=spec["grid"],
+        scoring="roc_auc",
+        cv=StratifiedKFold(n_splits=N_INNER, shuffle=True, random_state=inner_seed),
+        refit=True,
+        n_jobs=-1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transformación de entradas de la app a las variables del paper
+# ---------------------------------------------------------------------------
+def encode_sleep_quality(value) -> float:
+    if value is None:
+        return np.nan
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value) if 1 <= value <= 5 else np.nan
+    return float(SLEEP_QUALITY_MAP.get(str(value).strip().lower(), np.nan))
+
+
+def mspss_mean_from_items(items) -> float:
+    """Media de los 12 ítems MSPSS (escala 1-7). Devuelve NaN si está incompleto o fuera de rango."""
+    if items is None or len(items) != 12:
+        return np.nan
+    values = [float(v) for v in items]
+    if not all(1 <= v <= 7 for v in values):
+        return np.nan
+    return float(np.mean(values))
+
+
+# ---------------------------------------------------------------------------
+# Datos
+# ---------------------------------------------------------------------------
+def load_paper_dataset() -> pd.DataFrame:
+    """Snapshot analítico de NB01 (P1-P4, MSPSS 1-7)."""
+    if not os.path.exists(DATASET_PATH):
+        raise FileNotFoundError(f"No se encontró el dataset analítico del paper en {DATASET_PATH}")
+    df = pd.read_csv(DATASET_PATH)
+    return df[FEATURES + [TARGET]].copy()
+
+
+def load_new_records(db) -> pd.DataFrame:
+    """
+    Registros nuevos de vista_seudonimizada_ml capturados con el modelo del paper
+    (MSPSS 1-7). Los registros previos usaban MSPSS 1-4 y no son comparables.
+    """
+    from ..models import VistaSeudonimizadaML
+
+    records = (
+        db.query(VistaSeudonimizadaML)
+        .filter(VistaSeudonimizadaML.origen_modelo.like(f"{PRIMARY_MODEL_NAME}%"))
+        .all()
+    )
+
+    rows = []
+    for r in records:
+        qs = [getattr(r, f"q{i}") for i in range(1, 10)]
+        if any(q is None for q in qs) or r.mspss_total is None or r.calidad_sueno is None:
+            continue
+        rows.append({
+            "sleep_hours": r.horas_sueno if r.horas_sueno is not None else np.nan,
+            "sleep_quality": encode_sleep_quality(r.calidad_sueno),
+            "mspss_mean": r.mspss_total / 12.0,
+            TARGET: int(sum(qs) >= PHQ9_CUTOFF),
+        })
+
+    df = pd.DataFrame(rows, columns=FEATURES + [TARGET])
+    return df.dropna(subset=["sleep_quality", "mspss_mean"])
+
+
+def get_initial_dataset(db=None) -> pd.DataFrame:
+    """Dataset de entrenamiento: snapshot del paper + registros nuevos compatibles (si hay BD)."""
+    df = load_paper_dataset()
     if db is None:
-        db = SessionLocal()
-        local_session = True
+        return df
     try:
-        from ..models import VistaSeudonimizadaML
-        records = db.query(VistaSeudonimizadaML).all()
-        
-        if not records:
-            # Fallback to local Excel if database is completely empty
-            if not os.path.exists(DATASET_PATH):
-                raise FileNotFoundError(f"No se encontró el dataset de depresión en {DATASET_PATH}")
-            df = pd.read_excel(DATASET_PATH)
-            if 'phq9_total' in df.columns:
-                df['target_binario'] = (df['phq9_total'] >= 10).astype(int)
-            else:
-                categorias_positivas = ['Moderada', 'Moderadamente severa', 'Severa']
-                df['target_binario'] = df['depresion_objetivo'].isin(categorias_positivas).astype(int)
-            return df
-        
-        data = []
-        for r in records:
-            if r.horas_sueno is not None and r.mspss_total is not None and r.historia_salud_mental is not None and r.calidad_sueno is not None:
-                # Construct target binary from phq9 sum (leakage-free target) if possible
-                q_sum = 0
-                has_qs = False
-                for q_idx in range(1, 10):
-                    val = getattr(r, f"q{q_idx}")
-                    if val is not None:
-                        q_sum += val
-                        has_qs = True
-                
-                if has_qs:
-                    target = 1 if q_sum >= 10 else 0
-                else:
-                    categorias_positivas = ['Moderada', 'Moderadamente severa', 'Severa', 'riesgo_depresion', 'alto_riesgo']
-                    target = 1 if r.prediction in categorias_positivas else 0
-                
-                data.append({
-                    "horas_sueno": r.horas_sueno,
-                    "mspss_total": r.mspss_total,
-                    "historia_salud_mental": r.historia_salud_mental,
-                    "calidad_sueno": r.calidad_sueno,
-                    "target_binario": target
-                })
-        
-        if not data:
-            # If records exist but all have null features, load fallback Excel
-            df = pd.read_excel(DATASET_PATH)
-            df['target_binario'] = (df['phq9_total'] >= 10).astype(int) if 'phq9_total' in df.columns else df['depresion_objetivo'].isin(['Moderada', 'Moderadamente severa', 'Severa']).astype(int)
-            return df
+        new = load_new_records(db)
+    except Exception as exc:
+        print(f"[ml_model] No se pudieron leer registros nuevos de la BD: {exc}")
+        return df
+    if new.empty:
+        return df
+    return pd.concat([df, new], ignore_index=True)
 
-        return pd.DataFrame(data)
-    finally:
-        if local_session:
-            db.close()
 
-def get_classifiers():
+# ---------------------------------------------------------------------------
+# Entrenamiento y evaluación
+# ---------------------------------------------------------------------------
+def _nested_oof(spec, X, y):
+    outer_cv = StratifiedKFold(n_splits=N_OUTER, shuffle=True, random_state=SEED)
+    oof = np.full(len(y), np.nan)
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X, y), start=1):
+        search = _grid_search(spec, inner_seed=SEED + fold)
+        search.fit(X.iloc[train_idx], y.iloc[train_idx])
+        oof[test_idx] = search.predict_proba(X.iloc[test_idx])[:, 1]
+    return oof
+
+
+def _metrics(y_true, prob):
+    pred = (prob >= DECISION_THRESHOLD).astype(int)
     return {
-        "LogisticRegression": LogisticRegression(
-            C=1.0, 
-            random_state=SEED_GLOBAL, 
-            max_iter=1000
-        ),
-        "DecisionTree": DecisionTreeClassifier(
-            max_depth=5, 
-            min_samples_leaf=10, 
-            random_state=SEED_GLOBAL
-        ),
-        "RandomForest": RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
-            min_samples_leaf=5,
-            class_weight='balanced',
-            random_state=SEED_GLOBAL,
-            n_jobs=-1
-        ),
-        "AdaBoost": AdaBoostClassifier(
-            n_estimators=100,
-            learning_rate=1.0,
-            random_state=SEED_GLOBAL
-        ),
-        "XGBoost": XGBClassifier(
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.1,
-            random_state=SEED_GLOBAL,
-            eval_metric='logloss'
-        )
+        "roc_auc": float(roc_auc_score(y_true, prob)),
+        "average_precision": float(average_precision_score(y_true, prob)),
+        "brier": float(brier_score_loss(y_true, prob)),
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "f1_score": float(f1_score(y_true, pred, zero_division=0)),
     }
+
 
 def train_and_compare_models(df=None, db=None):
     """
-    Entrena y compara 5 modelos clasificadores. Selecciona el modelo ganador basado
-    en balanced accuracy y lo guarda como el modelo de predicción activo.
+    Reproduce NB01: nested CV (OOF) para LR y RF, y despliega la Logistic Regression
+    (modelo primario del paper) ajustada sobre todo el dataset con C elegido por CV.
+
+    Retorna (results: dict[nombre -> métricas], winner_name).
+    `winner_name` es siempre el modelo primario: el paper no selecciona modelo por métrica.
     """
     if df is None:
         df = get_initial_dataset(db)
-        
-    X = df[COLS_NUM + COLS_NOM + COLS_ORD].copy()
-    y = df['target_binario']
-    
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, balanced_accuracy_score
-    
-    # 80-20 Stratified Train-Validation Split
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=SEED_GLOBAL, stratify=y
-    )
-    
-    classifiers = get_classifiers()
-    results = {}
-    pipelines = {}
-    
-    for name, clf in classifiers.items():
-        preprocessor = make_preprocessor()
-        pipeline = Pipeline([
-            ('preprocessor', preprocessor),
-            ('classifier', clf)
-        ])
-        
-        # Fit on train split
-        pipeline.fit(X_train, y_train)
-        
-        # Predict on val split
-        y_pred = pipeline.predict(X_val)
-        
-        # Calculate metrics
-        acc = float(accuracy_score(y_val, y_pred))
-        prec = float(precision_score(y_val, y_pred, zero_division=0))
-        rec = float(recall_score(y_val, y_pred, zero_division=0))
-        f1 = float(f1_score(y_val, y_pred, zero_division=0))
-        bal_acc = float(balanced_accuracy_score(y_val, y_pred))
-        
-        results[name] = {
-            "model_name": name,
-            "accuracy": acc,
-            "precision": prec,
-            "recall": rec,
-            "f1_score": f1,
-            "balanced_accuracy": bal_acc
-        }
-        
-        # Fit pipeline on all data for deployment
-        full_pipeline = Pipeline([
-            ('preprocessor', make_preprocessor()),
-            ('classifier', clf)
-        ])
-        full_pipeline.fit(X, y)
-        pipelines[name] = full_pipeline
-        
-    # Select winner by balanced accuracy
-    winner_name = max(results, key=lambda k: results[k]["balanced_accuracy"])
-    
-    # Save winning model
-    joblib.dump(pipelines[winner_name], MODEL_PATH)
-    print(f"OK: Modelo ML ganador '{winner_name}' guardado en: {MODEL_PATH}")
-    
-    # Add winner flag
-    for name in results:
-        results[name]["is_winner"] = (name == winner_name)
-        
-    return results, winner_name
 
-def train_and_save_model(df=None):
-    """Wrapper compatible para el pipeline antiguo de entrenamiento."""
-    results, winner_name = train_and_compare_models(df)
-    return results
+    X = df[FEATURES].astype(float)
+    y = df[TARGET].astype(int)
+
+    results = {}
+    for name, spec in MODEL_SPECS.items():
+        oof = _nested_oof(spec, X, y)
+        results[name] = {"model_name": name, **_metrics(y, oof)}
+
+    final_search = _grid_search(MODEL_SPECS[PRIMARY_MODEL_NAME], inner_seed=SEED)
+    final_search.fit(X, y)
+
+    artifact = {
+        "pipeline": final_search.best_estimator_,
+        "model_name": PRIMARY_MODEL_NAME,
+        "features": FEATURES,
+        "target": f"PHQ-9 >= {PHQ9_CUTOFF}",
+        "best_params": final_search.best_params_,
+        "decision_threshold": DECISION_THRESHOLD,
+        "n_train": int(len(y)),
+        "prevalence": float(y.mean()),
+        "oof_metrics": results,
+        "paper_dataset_sha256": DATASET_SHA256,
+    }
+    joblib.dump(artifact, MODEL_PATH)
+    print(
+        f"OK: {PRIMARY_MODEL_NAME} (paper) guardado en {MODEL_PATH} | "
+        f"best={json.dumps(final_search.best_params_)} | n={len(y)} | "
+        f"OOF AUC LR={results[PRIMARY_MODEL_NAME]['roc_auc']:.3f} "
+        f"RF={results[COMPARATOR_MODEL_NAME]['roc_auc']:.3f}"
+    )
+
+    for name in results:
+        results[name]["is_winner"] = name == PRIMARY_MODEL_NAME
+
+    return results, PRIMARY_MODEL_NAME
+
+
+_cached_artifact = None
+_cached_mtime = None
+
 
 def load_trained_model():
-    """Carga el modelo entrenado desde el archivo serializado, entrenándolo primero si no existe."""
+    """Carga el artefacto del modelo; lo entrena con el dataset del paper si no existe."""
+    global _cached_artifact, _cached_mtime
     if not os.path.exists(MODEL_PATH):
-        print(f"Modelo no encontrado en {MODEL_PATH}. Iniciando entrenamiento inicial...")
-        return train_and_save_model()
-    return joblib.load(MODEL_PATH)
+        print(f"Modelo no encontrado en {MODEL_PATH}. Entrenando con el dataset del paper...")
+        train_and_compare_models(load_paper_dataset())
+    mtime = os.path.getmtime(MODEL_PATH)
+    if _cached_artifact is None or mtime != _cached_mtime:
+        _cached_artifact = joblib.load(MODEL_PATH)
+        _cached_mtime = mtime
+    return _cached_artifact
 
-def predict_depression_risk(horas_sueno: float, mspss_total: int, historia_salud_mental: str, calidad_sueno: str):
+
+# ---------------------------------------------------------------------------
+# Inferencia
+# ---------------------------------------------------------------------------
+def predict_depression_risk(horas_sueno: float, calidad_sueno: str, mspss_respuestas):
     """
-    Realiza la predicción de riesgo de depresión (PHQ-9 >= 10) utilizando el modelo RandomForest.
-    
-    Retorna:
-        prediction (int): 1 si predice riesgo alto (depresión moderada-severa), 0 en caso contrario.
-        probability (float): Probabilidad en porcentaje (0.0 a 100.0) de pertenecer al grupo de riesgo.
+    Probabilidad de PHQ-9 >= 10 con la Logistic Regression del paper.
+
+    Args:
+        horas_sueno: horas de sueño (0-24). Si falta, el pipeline imputa la mediana de entrenamiento.
+        calidad_sueno: "Muy mala" | "Mala" | "Regular" | "Buena" | "Muy buena".
+        mspss_respuestas: 12 respuestas MSPSS en escala 1-7.
+
+    Returns:
+        (prediction, probability, mspss_mean)
+        prediction: 1 si prob >= DECISION_THRESHOLD.
+        probability: porcentaje 0-100.
+        mspss_mean: media MSPSS usada como predictor.
     """
-    pipeline = load_trained_model()
-    
-    # Crear un DataFrame con una sola fila para la predicción
-    input_data = pd.DataFrame([{
-        "horas_sueno": float(horas_sueno),
-        "mspss_total": int(mspss_total),
-        "historia_salud_mental": str(historia_salud_mental),
-        "calidad_sueno": str(calidad_sueno)
-    }])
-    
-    prediction = int(pipeline.predict(input_data)[0])
-    probabilities = pipeline.predict_proba(input_data)[0]
-    
-    # Probabilidad del target binario = 1
-    probability = float(round(probabilities[1] * 100, 2))
-    
-    return prediction, probability
+    sleep_quality = encode_sleep_quality(calidad_sueno)
+    if pd.isna(sleep_quality):
+        raise ValueError(f"calidad_sueno no reconocida: {calidad_sueno!r}")
+
+    mspss_mean = mspss_mean_from_items(mspss_respuestas)
+    if pd.isna(mspss_mean):
+        raise ValueError("MSPSS debe tener 12 respuestas en escala 1-7.")
+
+    artifact = load_trained_model()
+    pipeline = artifact["pipeline"]
+    threshold = artifact.get("decision_threshold", DECISION_THRESHOLD)
+
+    X = pd.DataFrame([{
+        "sleep_hours": float(horas_sueno) if horas_sueno is not None else np.nan,
+        "sleep_quality": sleep_quality,
+        "mspss_mean": mspss_mean,
+    }], columns=FEATURES)
+
+    prob = float(pipeline.predict_proba(X)[0, 1])
+    prediction = int(prob >= threshold)
+    return prediction, round(prob * 100, 2), round(mspss_mean, 4)
