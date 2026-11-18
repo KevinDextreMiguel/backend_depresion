@@ -1,6 +1,6 @@
 fastapi>=0.110.0
 uvicorn>=0.28.0
-sqlalchemy>=2.0.28
+sqlalchemy>=2.0.28,<2.1  # 2.1 cambia el driver por defecto a psycopg (v3); el proyecto usa psycopg2
 psycopg2-binary>=2.9.9
 pydantic>=2.6.4
 pydantic-settings>=2.2.1
