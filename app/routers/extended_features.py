@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 from sqlalchemy import func, extract, cast, String, desc, and_
 
 from ..database import get_db
@@ -25,8 +25,20 @@ from ..schemas import (
     PoliticaVersionHistorialItem
 )
 from ..security import require_role, get_current_user, db_decrypt
+from ..utils.queries import phq9_scores_subquery, phq9_scores_for
+from ..utils.dates import local_day_start, local_day_end_exclusive
+from ..utils.clinical import resolve_psicologo, is_psicologo_without_profile, audit_access
 
 router = APIRouter(prefix="/admin-ext", tags=["Extended Features"])
+
+
+def _psico_scope(current_user: dict, db: Session):
+    """
+    (psicologo, sin_cartera). Un psicólogo solo ve datos de su cartera; si no tiene
+    perfil de psicólogo, no ve nada. El admin (psicologo=None) ve todo.
+    """
+    psicologo = resolve_psicologo(current_user, db)
+    return psicologo, is_psicologo_without_profile(current_user, psicologo)
 
 
 # ============================================================================
@@ -41,7 +53,7 @@ def get_system_config(db: Session, key: str, default: str = "") -> str:
 
 
 @router.get("/tc-status", response_model=TerminosStatusResponse)
-async def get_tc_status(
+def get_tc_status(
     ip: str = Query("127.0.0.1"),
     user_id: Optional[str] = Query(None),
     db: Session = Depends(get_db)
@@ -140,7 +152,7 @@ async def accept_tc(
 
 
 @router.get("/consent-status", response_model=ConsentStatusResponse)
-async def get_consent_status(
+def get_consent_status(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -172,7 +184,7 @@ async def get_consent_status(
 
 
 @router.post("/consent-accept")
-async def accept_consent(
+def accept_consent(
     payload: ConsentAcceptRequest,
     request: Request,
     current_user: dict = Depends(get_current_user),
@@ -211,7 +223,7 @@ async def accept_consent(
 
 
 @router.get("/consent-history", response_model=List[UserConsentHistoryItem])
-async def get_consent_history(
+def get_consent_history(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -229,62 +241,72 @@ async def get_consent_history(
 # ============================================================================
 
 @router.get("/dashboard-kpis", response_model=KPIsDashboardResponse)
-async def get_dashboard_kpis(
+def get_dashboard_kpis(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
-    """Visualización de KPIs clave del panel de administración."""
-    eval_query = db.query(Evaluacion)
+    """Visualización de KPIs clave del panel (psicólogo: solo su cartera)."""
+    psicologo, sin_cartera = _psico_scope(current_user, db)
     res_query = db.query(Resultado)
     int_query = db.query(Intervencion)
     deriv_query = db.query(DerivacionClinica)
-    
+    eval_filters = []
+    if sin_cartera:
+        eval_filters.append(Evaluacion.id_evaluacion.is_(None))
+        res_query = res_query.filter(Resultado.id_resultado.is_(None))
+        int_query = int_query.filter(Intervencion.id_intervencion.is_(None))
+        deriv_query = deriv_query.filter(DerivacionClinica.id_derivacion.is_(None))
+    elif psicologo is not None:
+        eval_filters.append(Evaluacion.id_psicologo == psicologo.id_psicologo)
+        res_query = res_query.join(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion).filter(
+            Evaluacion.id_psicologo == psicologo.id_psicologo
+        )
+        int_query = int_query.filter(Intervencion.id_psicologo == psicologo.id_psicologo)
+        deriv_query = deriv_query.filter(DerivacionClinica.id_psicologo == psicologo.id_psicologo)
+
     # Apply date filters
     if start_date:
-        sd = datetime.fromisoformat(start_date)
-        eval_query = eval_query.filter(Evaluacion.fecha_evaluacion >= sd)
+        sd = local_day_start(start_date)
+        eval_filters.append(Evaluacion.fecha_evaluacion >= sd)
         res_query = res_query.filter(Resultado.fecha_resultado >= sd)
         int_query = int_query.filter(Intervencion.fecha_intervencion >= sd)
         deriv_query = deriv_query.filter(DerivacionClinica.fecha_derivacion >= sd)
     if end_date:
-        ed = datetime.fromisoformat(end_date) + timedelta(days=1)
-        eval_query = eval_query.filter(Evaluacion.fecha_evaluacion < ed)
+        ed = local_day_end_exclusive(end_date)
+        eval_filters.append(Evaluacion.fecha_evaluacion < ed)
         res_query = res_query.filter(Resultado.fecha_resultado < ed)
         int_query = int_query.filter(Intervencion.fecha_intervencion < ed)
         deriv_query = deriv_query.filter(DerivacionClinica.fecha_derivacion < ed)
-        
-    total_screenings = eval_query.count()
-    
-    # Average score
-    subquery = db.query(
-        Respuesta.id_evaluacion,
-        func.sum(Respuesta.valor).label("total_score")
-    ).group_by(Respuesta.id_evaluacion).subquery()
-    
-    # Filter subquery by date of evaluations
-    eval_ids = [r.id_evaluacion for r in eval_query.all()]
-    if eval_ids:
-        avg_score = db.query(func.avg(subquery.c.total_score)).filter(subquery.c.id_evaluacion.in_(eval_ids)).scalar() or 0.0
-    else:
-        avg_score = 0.0
-        
-    # Risk distribution
-    dist_counts = db.query(
-        Resultado.nivel_riesgo,
-        func.count(Resultado.id_resultado)
+
+    total_screenings = db.query(func.count(Evaluacion.id_evaluacion)).filter(*eval_filters).scalar() or 0
+
+    # Puntaje promedio y distribución agregados en SQL (antes se cargaban
+    # todos los IDs de evaluaciones en memoria y se enviaban en un IN gigante).
+    scores = phq9_scores_subquery(db)
+    avg_score = (
+        db.query(func.avg(scores.c.puntaje))
+        .join(Evaluacion, Evaluacion.id_evaluacion == scores.c.id_evaluacion)
+        .filter(*eval_filters)
+        .scalar()
+        or 0.0
     )
-    if eval_ids:
-        dist_counts = dist_counts.filter(Resultado.id_evaluacion.in_(eval_ids))
-    dist_counts = dist_counts.group_by(Resultado.nivel_riesgo).all()
-    
+
+    dist_counts = (
+        db.query(Resultado.nivel_riesgo, func.count(Resultado.id_resultado))
+        .join(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .filter(*eval_filters)
+        .group_by(Resultado.nivel_riesgo)
+        .all()
+    )
+
     dist_dict = {"minimo": 0, "leve": 0, "moderado": 0, "moderadamente_severo": 0, "severo": 0}
     for row in dist_counts:
         nivel, count = row[0], row[1]
         if nivel in dist_dict:
             dist_dict[nivel] = count
-            
+
     # Active alerts (suicide alert)
     alerts_query = res_query.filter(Resultado.alerta_suicidio == True)
     total_alerts = alerts_query.count()
@@ -318,81 +340,71 @@ async def get_dashboard_kpis(
 # ============================================================================
 
 @router.get("/trends-advanced", response_model=TrendsAdvancedResponse)
-async def get_trends_advanced(
+def get_trends_advanced(
     career: Optional[str] = Query(None),
     university: Optional[str] = Query(None),
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
     """Muestra tendencias por periodo, facultad/carrera o universidad con filtros."""
-    # Build core query
-    base_query = db.query(Evaluacion).join(Estudiante, Evaluacion.id_estudiante == Estudiante.id_estudiante)
+    # Todo se agrega en SQL con GROUP BY (antes: cargar todas las evaluaciones,
+    # una consulta por mes/carrera/universidad y lazy-load del estudiante por fila).
+    scores = phq9_scores_subquery(db)
+    filters = []
+    psicologo, sin_cartera = _psico_scope(current_user, db)
+    if sin_cartera:
+        filters.append(Evaluacion.id_evaluacion.is_(None))
+    elif psicologo is not None:
+        filters.append(Evaluacion.id_psicologo == psicologo.id_psicologo)
     if career:
-        base_query = base_query.filter(Estudiante.carrera == career)
+        filters.append(Estudiante.carrera == career)
     if university:
-        base_query = base_query.filter(Estudiante.universidad == university)
-        
-    evals = base_query.all()
-    eval_ids = [e.id_evaluacion for e in evals]
-    
+        filters.append(Estudiante.universidad == university)
+
+    def grouped(*cols):
+        return (
+            db.query(*cols, func.count(Evaluacion.id_evaluacion), func.avg(scores.c.puntaje))
+            .select_from(Evaluacion)
+            .join(Estudiante, Evaluacion.id_estudiante == Estudiante.id_estudiante)
+            .outerjoin(scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion)
+            .filter(*filters)
+        )
+
     # 1. By Month (Last 6 Months)
     now = datetime.utcnow()
     months = []
     for i in range(5, -1, -1):
         d = now - timedelta(days=30 * i)
         months.append({"year": d.year, "month": d.month, "label": d.strftime("%b")})
-        
-    subquery = db.query(
-        Respuesta.id_evaluacion,
-        func.sum(Respuesta.valor).label("total_score")
-    ).group_by(Respuesta.id_evaluacion).subquery()
-    
+    since = datetime(months[0]["year"], months[0]["month"], 1)
+
+    y_col = extract("year", Evaluacion.fecha_evaluacion).label("y")
+    m_col = extract("month", Evaluacion.fecha_evaluacion).label("m")
+    month_rows = (
+        grouped(y_col, m_col)
+        .filter(Evaluacion.fecha_evaluacion >= since)
+        .group_by("y", "m")
+        .all()
+    )
+    month_lookup = {(int(y), int(m)): (cnt, avg) for y, m, cnt, avg in month_rows if y is not None and m is not None}
+
     month_data = []
     for m in months:
-        m_evals = [e for e in evals if e.fecha_evaluacion.year == m["year"] and e.fecha_evaluacion.month == m["month"]]
-        m_ids = [e.id_evaluacion for e in m_evals]
-        if m_ids:
-            avg_s = db.query(func.avg(subquery.c.total_score)).filter(subquery.c.id_evaluacion.in_(m_ids)).scalar() or 0.0
-            count = len(m_ids)
-        else:
-            avg_s = 0.0
-            count = 0
-        month_data.append(TrendPoint(label=m["label"], count=count, avg_score=float(round(avg_s, 1))))
-        
+        cnt, avg_s = month_lookup.get((m["year"], m["month"]), (0, 0.0))
+        month_data.append(TrendPoint(label=m["label"], count=int(cnt or 0), avg_score=float(round(avg_s or 0.0, 1))))
+
     # 2. By Career
-    career_counts = db.query(
-        Estudiante.carrera,
-        func.count(Evaluacion.id_evaluacion)
-    ).join(Evaluacion, Estudiante.id_estudiante == Evaluacion.id_estudiante)
-    if eval_ids:
-        career_counts = career_counts.filter(Evaluacion.id_evaluacion.in_(eval_ids))
-    career_counts = career_counts.group_by(Estudiante.carrera).all()
-    
-    career_data = []
-    for c_name, c_cnt in career_counts:
-        c_eval_ids = [e.id_evaluacion for e in evals if e.estudiante.carrera == c_name]
-        c_avg = 0.0
-        if c_eval_ids:
-            c_avg = db.query(func.avg(subquery.c.total_score)).filter(subquery.c.id_evaluacion.in_(c_eval_ids)).scalar() or 0.0
-        career_data.append(TrendPoint(label=c_name or "Desconocido", count=c_cnt, avg_score=float(round(c_avg, 1))))
-        
+    career_data = [
+        TrendPoint(label=c_name or "Desconocido", count=int(c_cnt or 0), avg_score=float(round(c_avg or 0.0, 1)))
+        for c_name, c_cnt, c_avg in grouped(Estudiante.carrera).group_by(Estudiante.carrera).all()
+    ]
+
     # 3. By University
-    uni_counts = db.query(
-        Estudiante.universidad,
-        func.count(Evaluacion.id_evaluacion)
-    ).join(Evaluacion, Estudiante.id_estudiante == Evaluacion.id_estudiante)
-    if eval_ids:
-        uni_counts = uni_counts.filter(Evaluacion.id_evaluacion.in_(eval_ids))
-    uni_counts = uni_counts.group_by(Estudiante.universidad).all()
-    
-    uni_data = []
-    for u_name, u_cnt in uni_counts:
-        u_eval_ids = [e.id_evaluacion for e in evals if e.estudiante.universidad == u_name]
-        u_avg = 0.0
-        if u_eval_ids:
-            u_avg = db.query(func.avg(subquery.c.total_score)).filter(subquery.c.id_evaluacion.in_(u_eval_ids)).scalar() or 0.0
-        uni_data.append(TrendPoint(label=u_name or "Desconocido", count=u_cnt, avg_score=float(round(u_avg, 1))))
-        
+    uni_data = [
+        TrendPoint(label=u_name or "Desconocido", count=int(u_cnt or 0), avg_score=float(round(u_avg or 0.0, 1)))
+        for u_name, u_cnt, u_avg in grouped(Estudiante.universidad).group_by(Estudiante.universidad).all()
+    ]
+
     return TrendsAdvancedResponse(
         by_month=month_data,
         by_career=career_data,
@@ -405,45 +417,64 @@ async def get_trends_advanced(
 # ============================================================================
 
 @router.get("/interventions/effectiveness", response_model=List[InterventionEffectivenessItem])
-async def get_interventions_effectiveness(
+def get_interventions_effectiveness(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
     """Mide la variación en el nivel de riesgo antes y después de intervenciones."""
     # We match student interventions with evaluations before and after the intervention date.
-    interventions = db.query(Intervencion).order_by(Intervencion.fecha_intervencion.desc()).all()
-    
+    psicologo, sin_cartera = _psico_scope(current_user, db)
+    if sin_cartera:
+        return []
+    int_query = db.query(Intervencion)
+    if psicologo is not None:
+        int_query = int_query.filter(Intervencion.id_psicologo == psicologo.id_psicologo)
+    interventions = int_query.order_by(Intervencion.fecha_intervencion.desc()).all()
+    if not interventions:
+        return []
+
+    # Todas las evaluaciones (con resultado y puntaje) de los estudiantes
+    # intervenidos en una sola consulta; antes eran 4 consultas por intervención.
+    scores = phq9_scores_subquery(db)
+    student_ids = {inter.id_estudiante for inter in interventions}
+    eval_rows = (
+        db.query(
+            Evaluacion.id_estudiante,
+            Evaluacion.fecha_evaluacion,
+            Resultado.nivel_riesgo,
+            scores.c.puntaje,
+        )
+        .join(Resultado, Resultado.id_evaluacion == Evaluacion.id_evaluacion)
+        .outerjoin(scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion)
+        .filter(Evaluacion.id_estudiante.in_(student_ids))
+        .order_by(Evaluacion.fecha_evaluacion.asc())
+        .all()
+    )
+    evals_by_student: Dict[Any, list] = {}
+    for row in eval_rows:
+        evals_by_student.setdefault(row.id_estudiante, []).append(row)
+
     results = []
     for inter in interventions:
-        # Pre-intervention evaluation (latest evaluation before intervention)
-        pre_eval = db.query(Evaluacion).join(Resultado).filter(
-            and_(Evaluacion.id_estudiante == inter.id_estudiante, Evaluacion.fecha_evaluacion < inter.fecha_intervencion)
-        ).order_by(Evaluacion.fecha_evaluacion.desc()).first()
-        
-        # Post-intervention evaluation (earliest evaluation after intervention)
-        post_eval = db.query(Evaluacion).join(Resultado).filter(
-            and_(Evaluacion.id_estudiante == inter.id_estudiante, Evaluacion.fecha_evaluacion >= inter.fecha_intervencion)
-        ).order_by(Evaluacion.fecha_evaluacion.asc()).first()
-        
+        student_evals = evals_by_student.get(inter.id_estudiante, [])
+        # Pre: última evaluación antes de la intervención. Post: primera desde la intervención.
+        pre_eval = next((e for e in reversed(student_evals) if e.fecha_evaluacion < inter.fecha_intervencion), None)
+        post_eval = next((e for e in student_evals if e.fecha_evaluacion >= inter.fecha_intervencion), None)
+
         if pre_eval and post_eval:
-            pre_res = pre_eval.resultado
-            post_res = post_eval.resultado
-            
-            # Fetch scores
-            pre_score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == pre_eval.id_evaluacion).scalar() or 0
-            post_score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == post_eval.id_evaluacion).scalar() or 0
-            
+            pre_score = pre_eval.puntaje or 0
+            post_score = post_eval.puntaje or 0
             results.append(
                 InterventionEffectivenessItem(
                     id_estudiante_anonimo=f"#{inter.id_estudiante.hex[:6].upper()}",
-                    antes_intervencion=pre_res.nivel_riesgo.replace("_", " ").capitalize(),
-                    despues_intervencion=post_res.nivel_riesgo.replace("_", " ").capitalize(),
+                    antes_intervencion=pre_eval.nivel_riesgo.replace("_", " ").capitalize(),
+                    despues_intervencion=post_eval.nivel_riesgo.replace("_", " ").capitalize(),
                     score_diff=int(post_score - pre_score), # Negative indicates improvement
                     fecha_intervencion=inter.fecha_intervencion,
                     tipo_intervencion=inter.tipo_intervencion
                 )
             )
-            
+
     return results
 
 
@@ -471,7 +502,7 @@ def generate_csv_data(rows: List[Dict[str, Any]]) -> str:
 
 
 @router.get("/reports/export/excel")
-async def export_excel(
+def export_excel(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     career: Optional[str] = Query(None),
@@ -481,18 +512,32 @@ async def export_excel(
     """Exporta reportes de screening en formato Excel (.xlsx)."""
     # Query matching data
     query = db.query(Evaluacion).join(Resultado).join(Estudiante)
+    psicologo, sin_cartera = _psico_scope(current_user, db)
+    if sin_cartera:
+        query = query.filter(Evaluacion.id_evaluacion.is_(None))
+    elif psicologo is not None:
+        query = query.filter(Evaluacion.id_psicologo == psicologo.id_psicologo)
     if start_date:
-        query = query.filter(Evaluacion.fecha_evaluacion >= datetime.fromisoformat(start_date))
+        query = query.filter(Evaluacion.fecha_evaluacion >= local_day_start(start_date))
     if end_date:
-        query = query.filter(Evaluacion.fecha_evaluacion < datetime.fromisoformat(end_date) + timedelta(days=1))
+        query = query.filter(Evaluacion.fecha_evaluacion < local_day_end_exclusive(end_date))
     if career:
         query = query.filter(Estudiante.carrera == career)
         
-    evals = query.order_by(Evaluacion.fecha_evaluacion.desc()).all()
+    evals = (
+        query.options(contains_eager(Evaluacion.resultado), contains_eager(Evaluacion.estudiante))
+        .order_by(Evaluacion.fecha_evaluacion.desc())
+        .all()
+    )
+    scores_map = phq9_scores_for(db, (ev.id_evaluacion for ev in evals))
+    audit_access(
+        db, current_user, "exportacion_reporte_excel", "evaluacion", uuid.uuid4(),
+        f"Exportó {len(evals)} evaluaciones a EXCEL (desde={start_date or '-'}, hasta={end_date or '-'}, carrera={career or 'todas'}).",
+    )
     
     rows = []
     for ev in evals:
-        score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == ev.id_evaluacion).scalar() or 0
+        score = scores_map.get(ev.id_evaluacion, 0)
         rows.append({
             "id_anonimo": f"#{ev.id_estudiante.hex[:6].upper()}",
             "fecha": ev.fecha_evaluacion.strftime("%Y-%m-%d %H:%M:%S") if ev.fecha_evaluacion else "",
@@ -523,7 +568,7 @@ async def export_excel(
 
 
 @router.get("/reports/export/pdf")
-async def export_pdf(
+def export_pdf(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     career: Optional[str] = Query(None),
@@ -534,14 +579,28 @@ async def export_pdf(
     # For robust dependency-free execution, we create a beautiful text-based report stream representing PDF format,
     # or generate a simple PDF using reportlab if available.
     query = db.query(Evaluacion).join(Resultado).join(Estudiante)
+    psicologo, sin_cartera = _psico_scope(current_user, db)
+    if sin_cartera:
+        query = query.filter(Evaluacion.id_evaluacion.is_(None))
+    elif psicologo is not None:
+        query = query.filter(Evaluacion.id_psicologo == psicologo.id_psicologo)
     if start_date:
-        query = query.filter(Evaluacion.fecha_evaluacion >= datetime.fromisoformat(start_date))
+        query = query.filter(Evaluacion.fecha_evaluacion >= local_day_start(start_date))
     if end_date:
-        query = query.filter(Evaluacion.fecha_evaluacion < datetime.fromisoformat(end_date) + timedelta(days=1))
+        query = query.filter(Evaluacion.fecha_evaluacion < local_day_end_exclusive(end_date))
     if career:
         query = query.filter(Estudiante.carrera == career)
         
-    evals = query.order_by(Evaluacion.fecha_evaluacion.desc()).all()
+    evals = (
+        query.options(contains_eager(Evaluacion.resultado), contains_eager(Evaluacion.estudiante))
+        .order_by(Evaluacion.fecha_evaluacion.desc())
+        .all()
+    )
+    scores_map = phq9_scores_for(db, (ev.id_evaluacion for ev in evals))
+    audit_access(
+        db, current_user, "exportacion_reporte_pdf", "evaluacion", uuid.uuid4(),
+        f"Exportó {len(evals)} evaluaciones a PDF (desde={start_date or '-'}, hasta={end_date or '-'}, carrera={career or 'todas'}).",
+    )
     
     # We will attempt reportlab generation. If reportlab is not installed, we fallback to a beautiful formatted text layout.
     try:
@@ -577,7 +636,7 @@ async def export_pdf(
         
         table_data = [["ID Estudiante", "Fecha Tamizaje", "Nivel de Riesgo", "Score PHQ-9", "Alerta"]]
         for ev in evals:
-            score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == ev.id_evaluacion).scalar() or 0
+            score = scores_map.get(ev.id_evaluacion, 0)
             table_data.append([
                 f"#{ev.id_estudiante.hex[:6].upper()}",
                 ev.fecha_evaluacion.strftime("%Y-%m-%d"),
@@ -616,7 +675,7 @@ async def export_pdf(
         output.write(f"{'ID ANONIMO':<15}{'FECHA':<20}{'RIESGO':<25}{'PUNTAJE':<10}{'ALERTA SUICIDA'}\n")
         output.write("-" * 80 + "\n")
         for ev in evals:
-            score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == ev.id_evaluacion).scalar() or 0
+            score = scores_map.get(ev.id_evaluacion, 0)
             output.write(f"#{ev.id_estudiante.hex[:6].upper():<14}{ev.fecha_evaluacion.strftime('%Y-%m-%d %H:%M'):<20}{ev.resultado.nivel_riesgo.replace('_', ' ').capitalize():<25}{int(score):<10}{'SI' if ev.resultado.alerta_suicidio else 'NO'}\n")
             
         buffer = io.BytesIO(output.getvalue().encode("utf-8"))
@@ -628,7 +687,7 @@ async def export_pdf(
 # ============================================================================
 
 @router.get("/researcher/dataset")
-async def get_anonymized_dataset(
+def get_anonymized_dataset(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -673,7 +732,7 @@ async def get_anonymized_dataset(
 # ============================================================================
 
 @router.get("/monitoring/live", response_model=LiveMonitoringItem)
-async def get_live_monitoring(
+def get_live_monitoring(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -726,7 +785,7 @@ async def get_live_monitoring(
 # ============================================================================
 
 @router.get("/settings", response_model=List[ConfiguracionResponse])
-async def get_settings(
+def get_settings(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -735,7 +794,7 @@ async def get_settings(
 
 
 @router.put("/settings/{config_id}", response_model=ConfiguracionResponse)
-async def update_setting(
+def update_setting(
     config_id: UUID,
     payload: ConfiguracionUpdate,
     request: Request,
@@ -788,7 +847,7 @@ async def update_setting(
 
 
 @router.get("/tc-versions", response_model=List[PoliticaVersionHistorialItem])
-async def get_tc_versions(
+def get_tc_versions(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -803,13 +862,17 @@ async def get_tc_versions(
         .order_by(PoliticaVersionHistorial.fecha_publicacion.desc())
         .all()
     )
+    publisher_ids = {row.publicado_por for row in rows if row.publicado_por}
+    users_by_id = (
+        {u.id_usuario: u for u in db.query(Usuario).filter(Usuario.id_usuario.in_(publisher_ids)).all()}
+        if publisher_ids else {}
+    )
     results = []
     for row in rows:
         publicado_por_nombre = None
-        if row.publicado_por:
-            user = db.query(Usuario).filter(Usuario.id_usuario == row.publicado_por).first()
-            if user:
-                publicado_por_nombre = user.nombre or user.correo
+        user = users_by_id.get(row.publicado_por) if row.publicado_por else None
+        if user:
+            publicado_por_nombre = user.nombre or user.correo
         results.append(
             PoliticaVersionHistorialItem(
                 id_version=row.id_version,
@@ -829,11 +892,12 @@ async def get_tc_versions(
 # ============================================================================
 
 @router.get("/ml/audit", response_model=List[AuditoriaModelMLResponse])
-async def get_ml_audits(
+def get_ml_audits(
     tipo_evento: Optional[str] = Query(None, description="Filtra por 'entrenamiento' o 'prediccion'"),
     model_version: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=5000, description="Máximo de eventos a devolver (los más recientes)"),
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -847,11 +911,11 @@ async def get_ml_audits(
         query = query.filter(AuditoriaModelML.fecha_evento >= start_date)
     if end_date:
         query = query.filter(AuditoriaModelML.fecha_evento <= end_date)
-    return query.order_by(AuditoriaModelML.fecha_evento.desc()).all()
+    return query.order_by(AuditoriaModelML.fecha_evento.desc()).limit(limit).all()
 
 
 @router.get("/ml/metrics", response_model=List[MLModelMetricsDetail])
-async def get_ml_metrics(
+def get_ml_metrics(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):

@@ -11,6 +11,7 @@ from .exceptions import http_exception_handler, validation_exception_handler
 from sqlalchemy.orm import Session
 from uuid import UUID
 from typing import Dict, Any
+from starlette.concurrency import run_in_threadpool
 
 # Initialize database tables automatically (for sqlite or postgres schema safety)
 # Usually tables are built via schema.sql in Supabase, but this ensures they exist locally/for testing
@@ -51,6 +52,11 @@ if _db_ok:
                         pass
         except Exception as alter_err:
             print(f"[MindCheck] Error al verificar/migrar esquema: {alter_err}")
+
+        # Índices de rendimiento (idempotentes) para las consultas del panel.
+        from .db_indexes import ensure_performance_indexes, PERFORMANCE_INDEXES
+        _idx_ok = ensure_performance_indexes(engine)
+        print(f"[MindCheck] Índices de rendimiento verificados: {_idx_ok}/{len(PERFORMANCE_INDEXES)}")
         
         # Seed default configurations if not exists
         try:
@@ -163,6 +169,25 @@ _always_allowed = [
     "https://frontend-depresion.vercel.app",
 ]
 _cors_origins = list(set(_cors_origins_from_env + _always_allowed))
+
+
+# Errores no controlados -> JSON 500 legible. Se registra ANTES que CORSMiddleware
+# para quedar dentro de él: así la respuesta de error lleva cabeceras CORS. Sin
+# esto, el navegador bloquea el 500 y el frontend solo ve "Failed to fetch".
+@app.middleware("http")
+async def _unhandled_errors_as_json(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        import traceback
+        from fastapi.responses import JSONResponse
+
+        traceback.print_exc()
+        detail = f"Error interno del servidor ({type(exc).__name__})"
+        if settings.DEBUG:
+            detail += f": {exc}"
+        return JSONResponse(status_code=500, content={"detail": detail})
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -392,7 +417,7 @@ async def compatibility_get_all_users(
     db: Session = Depends(get_db)
 ):
     from .routers.admin import get_all_users
-    return await get_all_users(current_user, db)
+    return await run_in_threadpool(get_all_users, current_user, db)
 
 
 @app.put("/make-server-d427d5bf/admin/users/{user_id}", include_in_schema=False)
@@ -412,7 +437,7 @@ async def compatibility_update_user(
         rol=payload.get("rol"),
         activo=payload.get("activo")
     )
-    return await update_user(user_id, body, request, current_user, db)
+    return await run_in_threadpool(update_user, user_id, body, request, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/admin/model/status", include_in_schema=False)
@@ -421,7 +446,7 @@ async def compatibility_get_model_status(
     db: Session = Depends(get_db)
 ):
     from .routers.admin import get_model_status
-    return await get_model_status(current_user, db)
+    return await run_in_threadpool(get_model_status, current_user, db)
 
 
 @app.post("/make-server-d427d5bf/admin/model/retrain", include_in_schema=False)
@@ -440,9 +465,10 @@ async def compatibility_retrain_model(
         model_name=payload.get("model_name"),
         version=payload.get("version"),
         origen_datos=payload.get("origen_datos"),
-        comentario=payload.get("comentario")
+        comentario=payload.get("comentario"),
+        incluir_comparador=bool(payload.get("incluir_comparador", False)),
     )
-    return await retrain_model(body, request, current_user, db)
+    return await run_in_threadpool(retrain_model, body, request, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/statistics", include_in_schema=False)
@@ -455,7 +481,7 @@ async def compatibility_statistics(
     to fetch real-time aggregated scoring and risk levels.
     """
     from .routers.admin import get_statistics
-    return await get_statistics(current_user, db)
+    return await run_in_threadpool(get_statistics, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/health", include_in_schema=False)
@@ -472,7 +498,7 @@ async def compatibility_reports(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_reports
-    return await get_reports(current_user, db)
+    return await run_in_threadpool(get_reports, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/derivations", include_in_schema=False)
@@ -481,12 +507,13 @@ async def compatibility_derivations(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_clinical_derivations
-    return await get_clinical_derivations(current_user, db)
+    return await run_in_threadpool(get_clinical_derivations, current_user, db)
 
 
 @app.put("/make-server-d427d5bf/derivations/{derivation_id}", include_in_schema=False)
 async def compatibility_update_derivation(
     derivation_id: UUID,
+    request: Request,
     payload: Dict[str, Any] = Body(...),
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
@@ -495,7 +522,22 @@ async def compatibility_update_derivation(
     from .routers.admin import update_clinical_derivation
 
     body = DerivacionUpdate(**payload)
-    return await update_clinical_derivation(derivation_id, body, current_user=current_user, db=db)
+    return await run_in_threadpool(
+        update_clinical_derivation, derivation_id, body, request, current_user=current_user, db=db
+    )
+
+
+@app.put("/make-server-d427d5bf/admin/appointments/{appointment_id}", include_in_schema=False)
+async def compatibility_update_appointment(
+    appointment_id: UUID,
+    payload: Dict[str, Any] = Body(...),
+    current_user: dict = Depends(require_role(["admin", "psicologo"])),
+    db: Session = Depends(get_db),
+):
+    from .schemas import AppointmentUpdate
+    from .routers.admin import update_appointment
+
+    return await run_in_threadpool(update_appointment, appointment_id, AppointmentUpdate(**payload), current_user, db)
 
 
 @app.get("/make-server-d427d5bf/student-history/{anon_student_id}", include_in_schema=False)
@@ -505,7 +547,17 @@ async def compatibility_student_history(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_student_history
-    return await get_student_history(anon_student_id, current_user, db)
+    return await run_in_threadpool(get_student_history, anon_student_id, current_user, db)
+
+
+@app.get("/make-server-d427d5bf/student-history/{anon_student_id}/export/pdf", include_in_schema=False)
+async def compatibility_export_student_history_pdf(
+    anon_student_id: str,
+    current_user: dict = Depends(require_role(["admin", "psicologo"])),
+    db: Session = Depends(get_db),
+):
+    from .routers.admin import export_student_history_pdf
+    return await run_in_threadpool(export_student_history_pdf, anon_student_id, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/student/evolution", include_in_schema=False)
@@ -514,7 +566,7 @@ async def compatibility_student_evolution(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_student_evolution
-    return await get_student_evolution(current_user, db)
+    return await run_in_threadpool(get_student_evolution, current_user, db)
 
 
 @app.post("/make-server-d427d5bf/student-history/{anon_student_id}/observations", status_code=status.HTTP_201_CREATED, include_in_schema=False)
@@ -525,7 +577,7 @@ async def compatibility_create_student_observation(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import create_student_observation
-    return await create_student_observation(anon_student_id, payload, current_user, db)
+    return await run_in_threadpool(create_student_observation, anon_student_id, payload, current_user, db)
 
 
 @app.put("/make-server-d427d5bf/observations/{observation_id}", include_in_schema=False)
@@ -536,7 +588,7 @@ async def compatibility_update_student_observation(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import update_student_observation
-    return await update_student_observation(observation_id, payload, current_user, db)
+    return await run_in_threadpool(update_student_observation, observation_id, payload, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/admin/assigned-patients", include_in_schema=False)
@@ -547,7 +599,7 @@ async def compatibility_get_assigned_patients(
 ):
     from .routers.admin import get_assigned_patients
     risk_levels = request.query_params.getlist("risk_levels") or None
-    return await get_assigned_patients(current_user, db, risk_levels)
+    return await run_in_threadpool(get_assigned_patients, current_user, db, risk_levels)
 
 
 @app.get("/make-server-d427d5bf/admin/appointments", include_in_schema=False)
@@ -556,7 +608,7 @@ async def compatibility_list_appointments(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import list_appointments
-    return await list_appointments(current_user, db)
+    return await run_in_threadpool(list_appointments, current_user, db)
 
 
 @app.post("/make-server-d427d5bf/admin/appointments", status_code=status.HTTP_201_CREATED, include_in_schema=False)
@@ -568,7 +620,7 @@ async def compatibility_create_appointment(
     from .routers.admin import create_appointment
     from .schemas import AppointmentCreate
     body = AppointmentCreate(**payload)
-    return await create_appointment(body, current_user, db)
+    return await run_in_threadpool(create_appointment, body, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/student-history/{anon_student_id}/interventions", include_in_schema=False)
@@ -578,7 +630,7 @@ async def compatibility_get_student_interventions(
     db: Session = Depends(get_db)
 ):
     from .routers.admin import get_student_interventions
-    return await get_student_interventions(anon_student_id, current_user, db)
+    return await run_in_threadpool(get_student_interventions, anon_student_id, current_user, db)
 
 
 @app.post("/make-server-d427d5bf/student-history/{anon_student_id}/interventions", status_code=status.HTTP_201_CREATED, include_in_schema=False)
@@ -591,7 +643,7 @@ async def compatibility_create_student_intervention(
     from .routers.admin import create_student_intervention
     from .schemas import IntervencionCreate
     body = IntervencionCreate(**payload)
-    return await create_student_intervention(anon_student_id, body, current_user, db)
+    return await run_in_threadpool(create_student_intervention, anon_student_id, body, current_user, db)
 
 
 @app.put("/make-server-d427d5bf/interventions/{intervention_id}", include_in_schema=False)
@@ -604,7 +656,7 @@ async def compatibility_update_clinical_intervention(
     from .routers.admin import update_clinical_intervention
     from .schemas import IntervencionUpdate
     body = IntervencionUpdate(**payload)
-    return await update_clinical_intervention(intervention_id, body, current_user, db)
+    return await run_in_threadpool(update_clinical_intervention, intervention_id, body, current_user, db)
 
 
 # --- HU0029: Notification Compatibility Routes ---
@@ -616,7 +668,7 @@ async def compatibility_get_notifications(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_notifications
-    return await get_notifications(solo_no_revisadas=solo_no_revisadas, current_user=current_user, db=db)
+    return await run_in_threadpool(get_notifications, solo_no_revisadas=solo_no_revisadas, current_user=current_user, db=db)
 
 
 @app.put("/make-server-d427d5bf/admin/notifications/{notification_id}/mark-revisada", include_in_schema=False)
@@ -629,7 +681,7 @@ async def compatibility_mark_notification_revisada(
     from .routers.admin import mark_notification_revisada
     from .schemas import NotificacionMarkRevisada
     body = NotificacionMarkRevisada(**payload)
-    return await mark_notification_revisada(notification_id, body, current_user, db)
+    return await run_in_threadpool(mark_notification_revisada, notification_id, body, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/trends", include_in_schema=False)
@@ -638,7 +690,7 @@ async def compatibility_trends(
     db: Session = Depends(get_db),
 ):
     from .routers.admin import get_monthly_trends
-    return await get_monthly_trends(current_user, db)
+    return await run_in_threadpool(get_monthly_trends, current_user, db)
 
 
 @app.get("/make-server-d427d5bf/chatbot/responses", include_in_schema=False)
@@ -647,7 +699,7 @@ async def compatibility_get_chatbot_responses(
     db: Session = Depends(get_db),
 ):
     from .routers.chatbot import get_chatbot_responses
-    return await get_chatbot_responses(active=active, db=db)
+    return await run_in_threadpool(get_chatbot_responses, active=active, db=db)
 
 
 @app.post("/make-server-d427d5bf/chatbot/responses", status_code=status.HTTP_201_CREATED)
@@ -660,7 +712,7 @@ async def compatibility_create_chatbot_response(
     from .routers.chatbot import create_chatbot_response
 
     body = ChatbotResponseCreate(**payload)
-    return await create_chatbot_response(body, current_user=current_user, db=db)
+    return await run_in_threadpool(create_chatbot_response, body, current_user=current_user, db=db)
 
 
 @app.put("/make-server-d427d5bf/chatbot/responses/{response_id}")
@@ -674,7 +726,7 @@ async def compatibility_update_chatbot_response(
     from .routers.chatbot import update_chatbot_response
 
     body = ChatbotResponseUpdate(**payload)
-    return await update_chatbot_response(response_id, body, current_user=current_user, db=db)
+    return await run_in_threadpool(update_chatbot_response, response_id, body, current_user=current_user, db=db)
 
 
 @app.delete("/make-server-d427d5bf/chatbot/responses/{response_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -684,7 +736,7 @@ async def compatibility_delete_chatbot_response(
     db: Session = Depends(get_db),
 ):
     from .routers.chatbot import delete_chatbot_response
-    return await delete_chatbot_response(response_id, current_user=current_user, db=db)
+    return await run_in_threadpool(delete_chatbot_response, response_id, current_user=current_user, db=db)
 
 
 if __name__ == "__main__":

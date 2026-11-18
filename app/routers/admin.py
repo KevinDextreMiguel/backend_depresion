@@ -7,7 +7,7 @@ from uuid import UUID
 from typing import List
 import io
 from ..database import get_db
-from ..models import Evaluacion, Resultado, Respuesta, Estudiante, DerivacionClinica, Usuario, AuditoriaAcceso, ModeloVersion, VistaSeudonimizadaML, ObservacionSeguimiento, Psicologo, Cita, Intervencion, Notificacion, AuditoriaModelML, ChatbotInteraccion
+from ..models import Evaluacion, Resultado, Respuesta, Pregunta, Estudiante, DerivacionClinica, Usuario, AuditoriaAcceso, ModeloVersion, VistaSeudonimizadaML, ObservacionSeguimiento, Psicologo, Cita, Intervencion, Notificacion, AuditoriaModelML, ChatbotInteraccion
 from ..schemas import (
     StatisticsResponse,
     RiskDistribution,
@@ -15,6 +15,7 @@ from ..schemas import (
     StudentHistoryItem,
     AssignedPatientItem,
     AppointmentCreate,
+    AppointmentUpdate,
     AppointmentResponse,
     UserResponse,
     UserUpdateRequest,
@@ -36,6 +37,19 @@ from ..schemas import (
     AuditLogListResponse,
 )
 from ..security import require_role, get_supabase_client
+from ..utils.queries import phq9_scores_subquery
+from ..utils.clinical import (
+    CASE_STATES,
+    OPEN_CASE_STATES,
+    audit_access,
+    escalate_overdue_alerts,
+    is_psicologo_without_profile,
+)
+
+# Nota de rendimiento: los endpoints que usan la sesión síncrona de SQLAlchemy
+# se declaran con `def` (no `async def`). FastAPI los ejecuta en un threadpool,
+# así varias consultas del panel corren en paralelo en lugar de bloquear el
+# event loop una tras otra.
 
 router = APIRouter(prefix="/admin", tags=["Administration & Reports"])
 
@@ -48,6 +62,26 @@ def _resolve_psicologo(current_user: dict, db: Session) -> Psicologo | None:
         return db.query(Psicologo).filter(Psicologo.id_usuario == UUID(current_user["id"])).first()
     except Exception:
         return None
+
+
+def _find_student_by_key(db: Session, student_key: str) -> Estudiante | None:
+    """
+    Busca un estudiante por el prefijo de su UUID (ID anónimo #XXXXXX).
+    Si el prefijo coincide con más de un estudiante, se rechaza en lugar de abrir
+    la historia de una persona equivocada.
+    """
+    matches = (
+        db.query(Estudiante)
+        .filter(func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key)
+        .limit(2)
+        .all()
+    )
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El ID anónimo coincide con más de un estudiante. Contacta al administrador para identificar el caso.",
+        )
+    return matches[0] if matches else None
 
 
 def _assert_student_in_scope(psicologo: Psicologo | None, student_id, db: Session) -> None:
@@ -70,54 +104,77 @@ def _assert_student_in_scope(psicologo: Psicologo | None, student_id, db: Sessio
         )
 
 @router.get("/statistics", response_model=StatisticsResponse)
-async def get_statistics(
+def get_statistics(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
     """
-    Fetches real-time clinical screening statistics, including total screenings,
-    average score, and a breakdown of risk levels for the admin dashboard.
+    Estadísticas del panel. Para un psicólogo se limitan a su cartera (evaluaciones
+    asignadas a él); para el admin, a toda la institución.
     """
-    # 1. Count total evaluations
-    total = db.query(Evaluacion).count()
-    if total == 0:
-        return StatisticsResponse(
-            total=0,
-            averageScore=0.0,
-            riskDistribution=RiskDistribution(minimal=0, mild=0, moderate=0, moderatelySevere=0, severe=0)
+    psicologo = _resolve_psicologo(current_user, db)
+    no_scope = is_psicologo_without_profile(current_user, psicologo)
+    empty = StatisticsResponse(
+        total=0, averageScore=0.0,
+        riskDistribution=RiskDistribution(minimal=0, mild=0, moderate=0, moderatelySevere=0, severe=0),
+    )
+    if no_scope:
+        return empty  # psicólogo sin perfil: sin cartera
+
+    eval_filters = [Evaluacion.id_psicologo == psicologo.id_psicologo] if psicologo is not None else []
+
+    # 0. Estudiantes
+    evaluated_students = (
+        db.query(func.count(func.distinct(Evaluacion.id_estudiante))).filter(*eval_filters).scalar() or 0
+    )
+    if psicologo is not None:
+        total_students = evaluated_students
+    else:
+        total_students = (
+            db.query(func.count(Estudiante.id_estudiante)).filter(Estudiante.activo.is_(True)).scalar() or 0
         )
 
-    # 2. Calculate average score
-    # Fetch all scores from results
-    scores_query = db.query(func.avg(Respuesta.valor)).scalar()
-    # Wait, the average PHQ-9 score is the sum of responses for each evaluation, averaged.
-    # Let's write a query that calculates the average sum of responses.
-    # Group responses by evaluation, sum them, and take the average.
-    subquery = db.query(
-        Respuesta.id_evaluacion, 
-        func.sum(Respuesta.valor).label("total_score")
-    ).group_by(Respuesta.id_evaluacion).subquery()
-    
-    avg_score = db.query(func.avg(subquery.c.total_score)).scalar() or 0.0
+    # 1. Casos abiertos y alertas suicidas activas (derivaciones no cerradas)
+    deriv_q = (
+        db.query(DerivacionClinica.estado, Resultado.alerta_suicidio)
+        .join(Resultado, Resultado.id_resultado == DerivacionClinica.id_resultado)
+        .filter(DerivacionClinica.estado.in_(OPEN_CASE_STATES))
+    )
+    if psicologo is not None:
+        deriv_q = deriv_q.filter(DerivacionClinica.id_psicologo == psicologo.id_psicologo)
+    open_rows = deriv_q.all()
+    open_cases = len(open_rows)
+    active_alerts = sum(1 for _, alerta in open_rows if alerta)
+    pending_contact = sum(1 for estado, _ in open_rows if estado == "pendiente")
 
-    # 3. Calculate risk distribution
-    # Risk categories match schema values: minimo, leve, moderado, moderadamente_severo, severo
-    distribution_counts = db.query(
-        Resultado.nivel_riesgo,
-        func.count(Resultado.id_resultado)
-    ).group_by(Resultado.nivel_riesgo).all()
+    # 2. Evaluaciones
+    total = db.query(func.count(Evaluacion.id_evaluacion)).filter(*eval_filters).scalar() or 0
+    if total == 0:
+        empty.totalStudents = total_students
+        empty.evaluatedStudents = evaluated_students
+        empty.openCases, empty.activeSuicideAlerts, empty.pendingContact = open_cases, active_alerts, pending_contact
+        return empty
 
-    dist_dict = {
-        "minimo": 0,
-        "leve": 0,
-        "moderado": 0,
-        "moderadamente_severo": 0,
-        "severo": 0
-    }
-    
-    for row in distribution_counts:
-        nivel = row[0]
-        count = row[1]
+    # 3. Puntaje PHQ-9 promedio (suma por evaluación, luego promedio)
+    scores = phq9_scores_subquery(db)
+    avg_score = (
+        db.query(func.avg(scores.c.puntaje))
+        .join(Evaluacion, Evaluacion.id_evaluacion == scores.c.id_evaluacion)
+        .filter(*eval_filters)
+        .scalar()
+        or 0.0
+    )
+
+    # 4. Distribución por nivel de riesgo
+    distribution_counts = (
+        db.query(Resultado.nivel_riesgo, func.count(Resultado.id_resultado))
+        .join(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .filter(*eval_filters)
+        .group_by(Resultado.nivel_riesgo)
+        .all()
+    )
+    dist_dict = {"minimo": 0, "leve": 0, "moderado": 0, "moderadamente_severo": 0, "severo": 0}
+    for nivel, count in distribution_counts:
         if nivel in dist_dict:
             dist_dict[nivel] = count
 
@@ -130,11 +187,16 @@ async def get_statistics(
             moderate=dist_dict["moderado"],
             moderatelySevere=dist_dict["moderadamente_severo"],
             severe=dist_dict["severo"]
-        )
+        ),
+        totalStudents=total_students,
+        evaluatedStudents=evaluated_students,
+        activeSuicideAlerts=active_alerts,
+        openCases=open_cases,
+        pendingContact=pending_contact,
     )
 
 @router.get("/reports", response_model=list[ReportItem])
-async def get_reports(
+def get_reports(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
@@ -142,7 +204,8 @@ async def get_reports(
     Lists screening reports with details. It maintains anonymity while
     including clinical metadata like career, risk level, and date.
     """
-    # Join Evaluacion, Resultado, Estudiante
+    # Join Evaluacion, Resultado, Estudiante + puntaje agregado en una sola consulta
+    scores = phq9_scores_subquery(db)
     query = db.query(
         Evaluacion.id_evaluacion,
         Evaluacion.fecha_evaluacion,
@@ -151,11 +214,14 @@ async def get_reports(
         Estudiante.id_estudiante,
         Estudiante.carrera,
         Estudiante.universidad,
-        Evaluacion.estado
+        Evaluacion.estado,
+        scores.c.puntaje,
     ).join(
         Resultado, Evaluacion.id_evaluacion == Resultado.id_evaluacion
     ).join(
         Estudiante, Evaluacion.id_estudiante == Estudiante.id_estudiante
+    ).outerjoin(
+        scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion
     )
 
     # Un psicólogo solo debe ver los reportes de los estudiantes que le fueron
@@ -171,18 +237,13 @@ async def get_reports(
     for row in results:
         # Build stable anonymous student ID from student UUID prefix.
         anon_id = f"#{row.id_estudiante.hex[:6].upper()}"
-        
-        # We calculate the score by summing the respuestas associated with the evaluation
-        score_sum = db.query(func.sum(Respuesta.valor)).filter(
-            Respuesta.id_evaluacion == row.id_evaluacion
-        ).scalar() or 0
 
         report_list.append(
             ReportItem(
                 id_anonimo=anon_id,
                 fecha=row.fecha_evaluacion,
                 nivel_riesgo=row.nivel_riesgo.replace("_", " ").capitalize(),
-                puntaje=int(score_sum),
+                puntaje=int(row.puntaje or 0),
                 alerta_suicidio=row.alerta_suicidio,
                 carrera=row.carrera,
                 universidad=row.universidad
@@ -192,27 +253,37 @@ async def get_reports(
     return report_list
 
 @router.get("/student-history/{anon_student_id}", response_model=list[StudentHistoryItem])
-async def get_student_history(
+def get_student_history(
     anon_student_id: str,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
 ):
     """
-    Retrieves a student's chronological evaluation history using the stable
-    anonymous identifier shown in the admin reports.
+    Historial cronológico de evaluaciones de un estudiante (por ID anónimo).
+    Cada lectura queda registrada en auditoria_acceso (trazabilidad de acceso a
+    historias clínicas).
     """
+    student, results = _build_student_history(anon_student_id, current_user, db)
+    audit_access(
+        db, current_user, "lectura_historial_clinico", "estudiante", student.id_estudiante,
+        f"Consultó el historial de {results[0].id_anonimo if results else anon_student_id} ({len(results)} evaluaciones).",
+    )
+    return results
+
+
+def _build_student_history(anon_student_id: str, current_user: dict, db: Session):
+    """Devuelve (estudiante, lista de StudentHistoryItem). Valida alcance del psicólogo."""
     student_key = anon_student_id.lstrip("#").strip().lower()
     if not student_key:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador de estudiante no válido")
 
-    student = db.query(Estudiante).filter(
-        func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key
-    ).first()
+    student = _find_student_by_key(db, student_key)
 
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
-    _assert_student_in_scope(_resolve_psicologo(current_user, db), student.id_estudiante, db)
+    psicologo = _resolve_psicologo(current_user, db)
+    _assert_student_in_scope(psicologo, student.id_estudiante, db)
 
     history_rows = (
         db.query(
@@ -241,55 +312,77 @@ async def get_student_history(
         .order_by(Evaluacion.fecha_evaluacion.desc())
         .all()
     )
-    results = []
-    for row in history_rows:
-        # fetch observations related to this evaluation
-        obs = db.query(ObservacionSeguimiento).filter(ObservacionSeguimiento.id_evaluacion == row.id_evaluacion).order_by(ObservacionSeguimiento.created_at.desc()).all()
-        obs_list = [
-            {
+    eval_ids = [row.id_evaluacion for row in history_rows]
+
+    # Datos por evaluación cargados en lote (antes eran 3 consultas por fila).
+    scores_by_eval: dict = {}
+    interp_by_eval: dict = {}
+    obs_by_eval: dict = {}
+    items_by_eval: dict = {}
+    if eval_ids:
+        # Respuestas PHQ-9 ítem por ítem (el ítem 9 es clave para valorar riesgo).
+        for eval_id, valor in (
+            db.query(Respuesta.id_evaluacion, Respuesta.valor)
+            .join(Pregunta, Pregunta.id_pregunta == Respuesta.id_pregunta)
+            .filter(Respuesta.id_evaluacion.in_(eval_ids))
+            .order_by(Respuesta.id_evaluacion, Pregunta.orden)
+            .all()
+        ):
+            items_by_eval.setdefault(eval_id, []).append(int(valor))
+        scores_by_eval = dict(
+            db.query(Respuesta.id_evaluacion, func.sum(Respuesta.valor))
+            .filter(Respuesta.id_evaluacion.in_(eval_ids))
+            .group_by(Respuesta.id_evaluacion)
+            .all()
+        )
+        # HU0018 (T-005): expone la interpretabilidad al psicólogo. Se consulta
+        # aparte porque Postgres 'json' plano no soporta igualdad para GROUP BY.
+        interp_by_eval = dict(
+            db.query(Resultado.id_evaluacion, Resultado.interpretabilidad)
+            .filter(Resultado.id_evaluacion.in_(eval_ids))
+            .all()
+        )
+        for o in (
+            db.query(ObservacionSeguimiento)
+            .filter(ObservacionSeguimiento.id_evaluacion.in_(eval_ids))
+            .order_by(ObservacionSeguimiento.created_at.desc())
+            .all()
+        ):
+            obs_by_eval.setdefault(o.id_evaluacion, []).append({
                 "id_observacion": o.id_observacion,
                 "id_evaluacion": o.id_evaluacion,
                 "id_psicologo": o.id_psicologo,
                 "texto": o.texto,
                 "created_at": o.created_at,
                 "updated_at": o.updated_at,
-            }
-            for o in obs
-        ]
+                # Solo el autor (o un admin) puede editarla; mismo criterio que el PUT.
+                "editable": psicologo is None or o.id_psicologo == psicologo.id_psicologo,
+            })
 
-        # HU0018 (T-005): expone la interpretabilidad al psicólogo, no solo al
-        # estudiante en el momento de envío. Se obtiene por fila (no vía GROUP BY,
-        # ya que Postgres 'json' plano no soporta igualdad para agrupar).
-        resultado_row = db.query(Resultado.interpretabilidad).filter(
-            Resultado.id_evaluacion == row.id_evaluacion
-        ).first()
-        interpretabilidad = resultado_row.interpretabilidad if resultado_row else None
-
+    results = []
+    for row in history_rows:
         results.append(
             StudentHistoryItem(
                 id_anonimo=f"#{student.id_estudiante.hex[:6].upper()}",
                 fecha=row.fecha_evaluacion,
                 nivel_riesgo=row.nivel_riesgo.replace("_", " ").capitalize(),
-                puntaje=int(
-                    db.query(func.sum(Respuesta.valor)).filter(
-                        Respuesta.id_evaluacion == row.id_evaluacion
-                    ).scalar() or 0
-                ),
+                puntaje=int(scores_by_eval.get(row.id_evaluacion) or 0),
                 alerta_suicidio=row.alerta_suicidio,
                 carrera=row.carrera,
                 universidad=row.universidad,
-                interpretabilidad=interpretabilidad,
+                interpretabilidad=interp_by_eval.get(row.id_evaluacion),
                 estado_evaluacion=row.estado,
                 comentarios=row.comentarios,
-                observaciones=obs_list,
+                observaciones=obs_by_eval.get(row.id_evaluacion, []),
+                respuestas_phq9=items_by_eval.get(row.id_evaluacion) or None,
             )
         )
 
-    return results
+    return student, results
 
 
 @router.get("/student-history/{anon_student_id}/export/pdf")
-async def export_student_history_pdf(
+def export_student_history_pdf(
     anon_student_id: str,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
@@ -300,7 +393,11 @@ async def export_student_history_pdf(
     para admin y para el psicólogo que tenga asignado al estudiante
     (reutiliza el mismo control de alcance que /student-history).
     """
-    history = await get_student_history(anon_student_id, current_user, db)
+    student, history = _build_student_history(anon_student_id, current_user, db)
+    audit_access(
+        db, current_user, "exportacion_historial_pdf", "estudiante", student.id_estudiante,
+        f"Exportó a PDF el historial de {history[0].id_anonimo if history else anon_student_id}.",
+    )
     if not history:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El estudiante no tiene evaluaciones registradas")
 
@@ -338,16 +435,17 @@ async def export_student_history_pdf(
         ))
 
         story.append(Paragraph("Historial y evolución de evaluaciones", section_style))
-        table_data = [["Fecha", "Nivel de Riesgo", "Puntaje PHQ-9", "Alerta", "Estado"]]
+        table_data = [["Fecha", "Nivel de Riesgo", "PHQ-9", "Ítem 9", "Alerta", "Estado"]]
         for item in history:
             table_data.append([
                 item.fecha.strftime("%Y-%m-%d") if item.fecha else "",
                 item.nivel_riesgo,
                 str(item.puntaje),
+                f"{item.respuestas_phq9[8]}/3" if item.respuestas_phq9 and len(item.respuestas_phq9) >= 9 else "—",
                 "CRITICO" if item.alerta_suicidio else "Normal",
                 item.estado_evaluacion or "",
             ])
-        t = Table(table_data, colWidths=[90, 130, 90, 80, 90])
+        t = Table(table_data, colWidths=[80, 130, 60, 60, 80, 90])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4A90E2')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -397,7 +495,7 @@ async def export_student_history_pdf(
 
 
 @router.get("/assigned-patients", response_model=list[AssignedPatientItem])
-async def get_assigned_patients(
+def get_assigned_patients(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
     risk_levels: list[str] | None = Query(default=None),
@@ -407,6 +505,7 @@ async def get_assigned_patients(
     Administrators can view the same listing for all students.
     """
     user_role = current_user.get("role")
+    scores = phq9_scores_subquery(db)
     query = db.query(
         Estudiante.id_estudiante,
         Estudiante.carrera,
@@ -416,10 +515,16 @@ async def get_assigned_patients(
         Evaluacion.estado,
         Resultado.nivel_riesgo,
         Resultado.alerta_suicidio,
+        scores.c.puntaje,
+        DerivacionClinica.estado.label("estado_caso"),
     ).join(
         Evaluacion, Estudiante.id_estudiante == Evaluacion.id_estudiante
     ).join(
         Resultado, Evaluacion.id_evaluacion == Resultado.id_evaluacion
+    ).outerjoin(
+        scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion
+    ).outerjoin(
+        DerivacionClinica, DerivacionClinica.id_resultado == Resultado.id_resultado
     )
 
     if user_role == "psicologo":
@@ -434,13 +539,13 @@ async def get_assigned_patients(
 
         query = query.filter(Evaluacion.id_psicologo == psicologo.id_psicologo)
 
+    # Evaluación más reciente de cada estudiante (global). Para el psicólogo, el
+    # filtro anterior deja solo a los estudiantes cuya evaluación más reciente
+    # está asignada a él: su cartera actual.
     subquery = db.query(
         Evaluacion.id_estudiante.label("estudiante_id"),
         func.max(Evaluacion.fecha_evaluacion).label("last_date"),
-    )
-    if user_role == "psicologo":
-        subquery = subquery.filter(Evaluacion.id_psicologo == psicologo.id_psicologo)
-    subquery = subquery.group_by(Evaluacion.id_estudiante).subquery()
+    ).group_by(Evaluacion.id_estudiante).subquery()
 
     query = query.join(
         subquery,
@@ -451,11 +556,22 @@ async def get_assigned_patients(
     if risk_levels:
         query = query.filter(Resultado.nivel_riesgo.in_(risk_levels))
 
-    query = query.order_by(Evaluacion.fecha_evaluacion.desc())
+    # Triaje: ítem 9 positivo con caso abierto, luego casos sin contactar,
+    # luego severidad y, a igual prioridad, lo más reciente primero.
+    severity_rank = {"severo": 0, "moderadamente_severo": 1, "moderado": 2, "leve": 3, "minimo": 4}
+    rows = sorted(
+        query.all(),
+        key=lambda r: (
+            0 if (r.alerta_suicidio and (r.estado_caso in OPEN_CASE_STATES)) else 1,
+            0 if r.estado_caso == "pendiente" else 1,
+            severity_rank.get(r.nivel_riesgo, 9),
+            -(r.fecha_evaluacion.timestamp() if r.fecha_evaluacion else 0),
+        ),
+    )
 
     assigned = []
-    for row in query.all():
-        score = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == row.id_evaluacion).scalar() or 0
+    for row in rows:
+        score = row.puntaje or 0
         assigned.append(
             AssignedPatientItem(
                 id_anonimo=f"#{row.id_estudiante.hex[:6].upper()}",
@@ -466,6 +582,7 @@ async def get_assigned_patients(
                 puntaje=int(score),
                 alerta_suicidio=row.alerta_suicidio,
                 estado_evaluacion=row.estado,
+                estado_caso=row.estado_caso,
             )
         )
 
@@ -473,7 +590,7 @@ async def get_assigned_patients(
 
 
 @router.get("/appointments", response_model=list[AppointmentResponse])
-async def list_appointments(
+def list_appointments(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
 ):
@@ -481,7 +598,9 @@ async def list_appointments(
     List appointments for the authenticated psychologist or all appointments for admin.
     """
     user_role = current_user.get("role")
-    query = db.query(Cita)
+    query = db.query(Cita, Estudiante.carrera).outerjoin(
+        Estudiante, Estudiante.id_estudiante == Cita.id_estudiante
+    )
     if user_role == "psicologo":
         try:
             psicologo = db.query(Psicologo).filter(Psicologo.id_usuario == UUID(current_user["id"])) .first()
@@ -502,14 +621,16 @@ async def list_appointments(
             estado=r.estado,
             descripcion=r.descripcion,
             created_at=r.created_at,
+            id_anonimo=f"#{r.id_estudiante.hex[:6].upper()}",
+            carrera=carrera,
         )
-        for r in rows
+        for r, carrera in rows
     ]
     return result
 
 
 @router.post("/appointments", response_model=AppointmentResponse, status_code=201)
-async def create_appointment(
+def create_appointment(
     payload: AppointmentCreate,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
@@ -523,9 +644,7 @@ async def create_appointment(
     if not student_key:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador de estudiante no válido")
 
-    student = db.query(Estudiante).filter(
-        func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key
-    ).first()
+    student = _find_student_by_key(db, student_key)
 
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
@@ -540,6 +659,8 @@ async def create_appointment(
             psicologo = None
         if psicologo is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Psicólogo no encontrado")
+        # Solo puede agendar con estudiantes de su cartera.
+        _assert_student_in_scope(psicologo, student.id_estudiante, db)
         psicologo_id = psicologo.id_psicologo
     else:
         # admin schedules using the most recent psychologist assigned to the student
@@ -587,11 +708,79 @@ async def create_appointment(
         estado=new.estado,
         descripcion=new.descripcion,
         created_at=new.created_at,
+        id_anonimo=f"#{student.id_estudiante.hex[:6].upper()}",
+        carrera=student.carrera,
+    )
+
+
+APPOINTMENT_STATES = {"programada", "completada", "no_asistio", "cancelada"}
+
+
+@router.put("/appointments/{appointment_id}", response_model=AppointmentResponse)
+def update_appointment(
+    appointment_id: UUID,
+    payload: AppointmentUpdate,
+    current_user: dict = Depends(require_role(["admin", "psicologo"])),
+    db: Session = Depends(get_db),
+):
+    """Completa, cancela, marca inasistencia o reprograma una cita."""
+    cita = db.query(Cita).filter(Cita.id_cita == appointment_id).first()
+    if cita is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cita no encontrada")
+
+    psicologo = _resolve_psicologo(current_user, db)
+    if is_psicologo_without_profile(current_user, psicologo) or (
+        psicologo is not None and cita.id_psicologo != psicologo.id_psicologo
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Esta cita no pertenece a tu agenda.")
+
+    if payload.estado is not None:
+        if payload.estado not in APPOINTMENT_STATES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Estado inválido. Usa: {', '.join(sorted(APPOINTMENT_STATES))}")
+        cita.estado = payload.estado
+    if payload.duracion_minutos is not None:
+        if not 15 <= payload.duracion_minutos <= 240:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La duración debe estar entre 15 y 240 minutos")
+        cita.duracion_minutos = payload.duracion_minutos
+    if payload.fecha_inicio is not None:
+        start = payload.fecha_inicio
+        end = start + timedelta(minutes=cita.duracion_minutos)
+        overlapping = db.query(Cita).filter(
+            Cita.id_psicologo == cita.id_psicologo,
+            Cita.id_cita != cita.id_cita,
+            Cita.estado == "programada",
+            Cita.fecha_inicio >= start - timedelta(hours=24),
+            Cita.fecha_inicio <= end + timedelta(hours=24),
+        ).all()
+        for ap in overlapping:
+            ap_end = ap.fecha_inicio + timedelta(minutes=ap.duracion_minutos)
+            if not (end <= ap.fecha_inicio or start >= ap_end):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ese horario ya está ocupado. Elige otro.")
+        cita.fecha_inicio = start
+        cita.estado = "programada"
+    if payload.descripcion is not None:
+        cita.descripcion = payload.descripcion
+
+    db.add(cita)
+    db.commit()
+    db.refresh(cita)
+    estudiante = db.query(Estudiante.carrera).filter(Estudiante.id_estudiante == cita.id_estudiante).first()
+    return AppointmentResponse(
+        id_cita=cita.id_cita,
+        id_psicologo=cita.id_psicologo,
+        id_estudiante=cita.id_estudiante,
+        fecha_inicio=cita.fecha_inicio,
+        duracion_minutos=cita.duracion_minutos,
+        estado=cita.estado,
+        descripcion=cita.descripcion,
+        created_at=cita.created_at,
+        id_anonimo=f"#{cita.id_estudiante.hex[:6].upper()}",
+        carrera=estudiante.carrera if estudiante else None,
     )
 
 
 @router.get("/student/evolution", response_model=List[StudentEvolutionItem])
-async def get_student_evolution(
+def get_student_evolution(
     current_user: dict = Depends(require_role(["estudiante", "admin", "psicologo"])),
     db: Session = Depends(get_db),
 ):
@@ -612,14 +801,17 @@ async def get_student_evolution(
         # If the caller is admin/psicologo and not a student, return empty
         return []
 
+    scores = phq9_scores_subquery(db)
     rows = (
         db.query(
             Evaluacion.id_evaluacion,
             Evaluacion.fecha_evaluacion,
             Resultado.nivel_riesgo,
             Resultado.alerta_suicidio,
+            scores.c.puntaje,
         )
         .join(Resultado, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .outerjoin(scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion)
         .filter(Evaluacion.id_estudiante == student.id_estudiante)
         .order_by(Evaluacion.fecha_evaluacion.asc())
         .all()
@@ -627,10 +819,9 @@ async def get_student_evolution(
 
     series = []
     for r in rows:
-        score = int(db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == r.id_evaluacion).scalar() or 0)
         series.append({
             "fecha": r.fecha_evaluacion,
-            "puntaje": score,
+            "puntaje": int(r.puntaje or 0),
             "nivel_riesgo": r.nivel_riesgo.replace("_", " ").capitalize(),
             "alerta_suicidio": r.alerta_suicidio,
         })
@@ -639,7 +830,7 @@ async def get_student_evolution(
 
 
 @router.post("/student-history/{anon_student_id}/observations", response_model=ObservacionResponse)
-async def create_student_observation(
+def create_student_observation(
     anon_student_id: str,
     payload: dict,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -656,14 +847,25 @@ async def create_student_observation(
     if not student_key:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador de estudiante no válido")
 
-    student = db.query(Estudiante).filter(
-        func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key
-    ).first()
+    student = _find_student_by_key(db, student_key)
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
     psicologo = _resolve_psicologo(current_user, db)
     _assert_student_in_scope(psicologo, student.id_estudiante, db)
+
+    # Sin evaluación indicada, se vincula a la más reciente del estudiante; si no,
+    # la observación quedaría huérfana y nunca aparecería en su historial.
+    if body.id_evaluacion is None:
+        latest = (
+            db.query(Evaluacion.id_evaluacion)
+            .filter(Evaluacion.id_estudiante == student.id_estudiante)
+            .order_by(Evaluacion.fecha_evaluacion.desc())
+            .first()
+        )
+        if latest is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El estudiante no tiene evaluaciones a las que asociar la observación")
+        body.id_evaluacion = latest.id_evaluacion
 
     # If an evaluation is provided, validate it belongs to the student
     if body.id_evaluacion is not None:
@@ -691,7 +893,7 @@ async def create_student_observation(
 
 
 @router.put("/observations/{observation_id}", response_model=ObservacionResponse)
-async def update_student_observation(
+def update_student_observation(
     observation_id: UUID,
     payload: dict,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -728,30 +930,51 @@ async def update_student_observation(
     }
 
 @router.get("/derivations", response_model=list[DerivacionResponse])
-async def get_clinical_derivations(
+def get_clinical_derivations(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
 ):
     """
-    Retrieves all pending or active clinical derivations, including risk metadata,
-    ordered by priority for triage.
+    Casos clínicos (derivaciones) ordenados para triaje. Un psicólogo ve solo los
+    casos asignados a él; el admin ve todos.
     """
-    derivations = db.query(
-        DerivacionClinica.id_derivacion,
-        DerivacionClinica.nivel_prioridad,
-        DerivacionClinica.accion_tomada,
-        DerivacionClinica.fecha_derivacion,
-        DerivacionClinica.estado,
-        DerivacionClinica.institucion_referencia,
-        Resultado.nivel_riesgo,
-        Resultado.alerta_suicidio
-    ).join(
-        Resultado, DerivacionClinica.id_resultado == Resultado.id_resultado
-    ).all()
+    psicologo = _resolve_psicologo(current_user, db)
+    if is_psicologo_without_profile(current_user, psicologo):
+        return []
 
-    parsed_derivations = []
-    for d in derivations:
-        parsed_derivations.append({
+    scores = phq9_scores_subquery(db)
+    query = (
+        db.query(
+            DerivacionClinica.id_derivacion,
+            DerivacionClinica.nivel_prioridad,
+            DerivacionClinica.accion_tomada,
+            DerivacionClinica.fecha_derivacion,
+            DerivacionClinica.estado,
+            DerivacionClinica.institucion_referencia,
+            Resultado.nivel_riesgo,
+            Resultado.alerta_suicidio,
+            Evaluacion.id_estudiante,
+            scores.c.puntaje,
+        )
+        .join(Resultado, DerivacionClinica.id_resultado == Resultado.id_resultado)
+        .join(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .outerjoin(scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion)
+    )
+    if psicologo is not None:
+        query = query.filter(DerivacionClinica.id_psicologo == psicologo.id_psicologo)
+
+    priority_order = {"urgente": 0, "alto": 1, "moderado": 2}
+    open_first = lambda estado: 0 if estado in OPEN_CASE_STATES else 1  # noqa: E731
+    rows = sorted(
+        query.all(),
+        key=lambda d: (
+            open_first(d.estado),
+            priority_order.get(d.nivel_prioridad, 99),
+            -(d.fecha_derivacion.timestamp() if d.fecha_derivacion else 0),
+        ),
+    )
+    return [
+        {
             "id": d.id_derivacion,
             "prioridad": d.nivel_prioridad,
             "accion": d.accion_tomada,
@@ -759,43 +982,61 @@ async def get_clinical_derivations(
             "estado": d.estado,
             "institucion": d.institucion_referencia,
             "nivel_riesgo": d.nivel_riesgo,
-            "alerta_suicidio": d.alerta_suicidio
-        })
-
-    priority_order = {
-        "urgente": 0,
-        "alto": 1,
-        "moderado": 2,
-    }
-
-    parsed_derivations.sort(
-        key=lambda item: (
-            priority_order.get(item["prioridad"], 99),
-            -item["fecha"].timestamp(),
-        )
-    )
-
-    return parsed_derivations
+            "alerta_suicidio": d.alerta_suicidio,
+            "id_anonimo": f"#{d.id_estudiante.hex[:6].upper()}" if d.id_estudiante else None,
+            "puntaje": int(d.puntaje) if d.puntaje is not None else None,
+        }
+        for d in rows
+    ]
 
 
 @router.put("/derivations/{derivation_id}", response_model=DerivacionResponse)
-async def update_clinical_derivation(
+def update_clinical_derivation(
     derivation_id: UUID,
     payload: DerivacionUpdate,
+    request: Request,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
 ):
     """
-    Updates the status or referral details of a clinical derivation for case prioritization.
+    Registra una acción sobre un caso y, opcionalmente, cambia su estado.
+    La nota es obligatoria al cambiar de estado; cada entrada queda en el
+    historial del caso (con fecha y autor) y en auditoria_acceso.
     """
     derivation = db.query(DerivacionClinica).filter(DerivacionClinica.id_derivacion == derivation_id).first()
     if derivation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Derivación clínica no encontrada")
 
-    if payload.estado is not None:
-        derivation.estado = payload.estado
-    if payload.accion_tomada is not None:
-        derivation.accion_tomada = payload.accion_tomada
+    psicologo = _resolve_psicologo(current_user, db)
+    if is_psicologo_without_profile(current_user, psicologo) or (
+        psicologo is not None and derivation.id_psicologo != psicologo.id_psicologo
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Este caso no está asignado a ti.")
+
+    nota = (payload.accion_tomada or "").strip()
+    nuevo_estado = payload.estado
+    if nuevo_estado is not None and nuevo_estado not in CASE_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Estado inválido. Usa: {', '.join(k for k in CASE_STATES if k != 'atendido')}",
+        )
+    cambia_estado = nuevo_estado is not None and nuevo_estado != derivation.estado
+    if cambia_estado and not nota:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Describe brevemente la acción realizada para cambiar el estado del caso.",
+        )
+
+    if nota or cambia_estado:
+        autor = current_user.get("email") or ("admin" if psicologo is None else "psicólogo")
+        sello = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        etiqueta = f" → {CASE_STATES[nuevo_estado]}" if cambia_estado else ""
+        entrada = f"[{sello} UTC · {autor}{etiqueta}] {nota}".strip()
+        # Entradas más recientes primero, una por línea.
+        derivation.accion_tomada = "\n".join(filter(None, [entrada, (derivation.accion_tomada or "").strip()]))
+    if cambia_estado:
+        anterior = derivation.estado
+        derivation.estado = nuevo_estado
     if payload.institucion_referencia is not None:
         derivation.institucion_referencia = payload.institucion_referencia
 
@@ -803,13 +1044,22 @@ async def update_clinical_derivation(
     db.commit()
     db.refresh(derivation)
 
-    result = db.query(Resultado.nivel_riesgo, Resultado.alerta_suicidio).join(
-        DerivacionClinica,
-        DerivacionClinica.id_resultado == Resultado.id_resultado
-    ).filter(DerivacionClinica.id_derivacion == derivation_id).first()
+    if nota or cambia_estado:
+        audit_access(
+            db, current_user, "actualizacion_caso_clinico", "derivacion_clinica", derivation.id_derivacion,
+            (f"Estado: {anterior} -> {nuevo_estado}. " if cambia_estado else "") + f"Nota: {nota}",
+            ip=request.client.host if request.client else None,
+        )
 
-    if result is None:
+    row = (
+        db.query(Resultado.nivel_riesgo, Resultado.alerta_suicidio, Evaluacion.id_estudiante, Evaluacion.id_evaluacion)
+        .join(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .filter(Resultado.id_resultado == derivation.id_resultado)
+        .first()
+    )
+    if row is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error al leer los datos de resultado asociados")
+    puntaje = db.query(func.sum(Respuesta.valor)).filter(Respuesta.id_evaluacion == row.id_evaluacion).scalar()
 
     return {
         "id": derivation.id_derivacion,
@@ -818,13 +1068,15 @@ async def update_clinical_derivation(
         "fecha": derivation.fecha_derivacion,
         "estado": derivation.estado,
         "institucion": derivation.institucion_referencia,
-        "nivel_riesgo": result.nivel_riesgo,
-        "alerta_suicidio": result.alerta_suicidio,
+        "nivel_riesgo": row.nivel_riesgo,
+        "alerta_suicidio": row.alerta_suicidio,
+        "id_anonimo": f"#{row.id_estudiante.hex[:6].upper()}",
+        "puntaje": int(puntaje) if puntaje is not None else None,
     }
 
 
 @router.get("/trends")
-async def get_monthly_trends(
+def get_monthly_trends(
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
 ):
@@ -842,6 +1094,14 @@ async def get_monthly_trends(
         func.sum(Respuesta.valor).label("total_score"),
     ).group_by(Respuesta.id_evaluacion).subquery()
 
+    # Psicólogo: solo su cartera.
+    psicologo = _resolve_psicologo(current_user, db)
+    scope = []
+    if psicologo is not None:
+        scope = [Evaluacion.id_psicologo == psicologo.id_psicologo]
+    elif is_psicologo_without_profile(current_user, psicologo):
+        scope = [Evaluacion.id_evaluacion.is_(None)]  # sin cartera: nada
+
     rows = (
         db.query(
             extract("year", Evaluacion.fecha_evaluacion).label("y"),
@@ -850,6 +1110,7 @@ async def get_monthly_trends(
             func.avg(subquery.c.total_score).label("promedio"),
         )
         .outerjoin(subquery, Evaluacion.id_evaluacion == subquery.c.id_evaluacion)
+        .filter(*scope)
         .group_by("y", "m")
         .order_by("y", "m")
         .all()
@@ -874,7 +1135,7 @@ async def get_monthly_trends(
     ]
 
 @router.get("/model/status", response_model=ModelStatusResponse)
-async def get_model_status(
+def get_model_status(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -915,7 +1176,7 @@ async def get_model_status(
 
 
 @router.post("/model/retrain", response_model=ModelRetrainResponse, status_code=status.HTTP_200_OK)
-async def retrain_model(
+def retrain_model(
     payload: ModelRetrainRequest,
     request: Request,
     current_user: dict = Depends(require_role(["admin"])),
@@ -938,7 +1199,9 @@ async def retrain_model(
 
     # 2. Entrenar y comparar todos los modelos
     try:
-        train_results, winner_name = train_and_compare_models(df_combined, db)
+        train_results, winner_name = train_and_compare_models(
+            df_combined, db, include_comparator=payload.incluir_comparador
+        )
     except Exception as train_err:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -985,47 +1248,58 @@ async def retrain_model(
 
     model_name = winner_name
 
-    if active_model:
-        active_model.activo = False
-        db.add(active_model)
+    if len(version) > 20:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La versión del modelo no puede superar los 20 caracteres.",
+        )
 
-    new_model = ModeloVersion(
-        nombre=model_name,
-        version=version,
-        origen_datos=payload.origen_datos or f"Supabase (dataset histórico + nuevos registros)",
-        comentario=payload.comentario or f"Reentrenamiento y comparación. Modelo ganador: {winner_name}.",
-        activo=True,
-    )
-    db.add(new_model)
-    db.commit()
-
-    # 4. Registrar evento en la tabla de AuditoriaModelML
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    # 3-4. Nueva versión + auditorías en UNA sola transacción: si algo falla no
+    # queda una versión activa sin su registro de auditoría (antes se hacía
+    # commit de la versión y luego fallaba el insert de auditoría).
+    client_ip = (request.client.host if request.client else "127.0.0.1")[:45]
     admin_id = UUID(current_user["id"])
-    
-    audit_ml = AuditoriaModelML(
-        tipo_evento="entrenamiento",
-        id_usuario=admin_id,
-        model_version=version,
-        precision=val_prec,
-        recall=val_rec,
-        f1_score=val_f1,
-        accuracy=val_acc,
-        resultado_prediccion=f"Modelo ganador: {winner_name}. Total registros: {len(df_combined)}."
-    )
-    db.add(audit_ml)
+    try:
+        if active_model:
+            active_model.activo = False
+            db.add(active_model)
 
-    # Log de acceso general
-    auditoria = AuditoriaAcceso(
-        id_usuario=admin_id,
-        accion="reentrenamiento_modelo",
-        tabla_objetivo="modelo_version",
-        id_objetivo=new_model.id_modelo,
-        ip_origen=client_ip,
-        detalle=f"Reentrenó y comparó modelos. Ganador: {winner_name} v{version}. Registros totales: {len(df_combined)}."
-    )
-    db.add(auditoria)
-    db.commit()
+        new_model = ModeloVersion(
+            nombre=model_name[:100],
+            version=version,
+            origen_datos=(payload.origen_datos or "Supabase (dataset histórico + nuevos registros)")[:255],
+            comentario=payload.comentario or f"Reentrenamiento. Modelo activo: {winner_name}.",
+            activo=True,
+        )
+        db.add(new_model)
+        db.flush()  # asigna id_modelo sin confirmar todavía
+
+        db.add(AuditoriaModelML(
+            tipo_evento="entrenamiento",
+            id_usuario=admin_id,
+            model_version=version,
+            precision=val_prec,
+            recall=val_rec,
+            f1_score=val_f1,
+            accuracy=val_acc,
+            # La columna es VARCHAR(50).
+            resultado_prediccion=f"{winner_name}; n={len(df_combined)}"[:50],
+        ))
+        db.add(AuditoriaAcceso(
+            id_usuario=admin_id,
+            accion="reentrenamiento_modelo",
+            tabla_objetivo="modelo_version",
+            id_objetivo=new_model.id_modelo,
+            ip_origen=client_ip,
+            detalle=f"Reentrenó el modelo. Activo: {winner_name} v{version}. Registros totales: {len(df_combined)}."
+        ))
+        db.commit()
+    except Exception as persist_err:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"El modelo se entrenó, pero no se pudo registrar la nueva versión: {persist_err}",
+        )
 
     return ModelRetrainResponse(
         success=True,
@@ -1033,13 +1307,17 @@ async def retrain_model(
         version=version,
         previous_version=previous_version,
         updated_records=len(df_combined),
-        message=f"Reentrenamiento completado. Modelo ganador: '{winner_name}' con balanced_accuracy={winner_metrics['balanced_accuracy']:.2%}",
+        message=(
+            f"Reentrenamiento completado. Modelo activo: '{winner_name}' "
+            f"(ROC-AUC OOF={winner_metrics.get('roc_auc', 0):.3f}, "
+            f"Brier={winner_metrics.get('brier', 0):.3f})"
+        ),
         comparison=comparison_list
     )
 
 
 @router.get("/users", response_model=list[UserResponse])
-async def get_all_users(
+def get_all_users(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
@@ -1051,7 +1329,7 @@ async def get_all_users(
 
 
 @router.put("/users/{user_id}", response_model=UserResponse)
-async def update_user(
+def update_user(
     user_id: UUID,
     update_data: UserUpdateRequest,
     request: Request,
@@ -1120,7 +1398,7 @@ async def update_user(
 # --- Clinical Interventions Routes (HU0027) ---
 
 @router.get("/student-history/{anon_student_id}/interventions", response_model=list[IntervencionResponse])
-async def get_student_interventions(
+def get_student_interventions(
     anon_student_id: str,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
@@ -1132,14 +1410,13 @@ async def get_student_interventions(
     if not student_key:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador de estudiante no válido")
 
-    student = db.query(Estudiante).filter(
-        func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key
-    ).first()
+    student = _find_student_by_key(db, student_key)
 
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
 
-    _assert_student_in_scope(_resolve_psicologo(current_user, db), student.id_estudiante, db)
+    psicologo = _resolve_psicologo(current_user, db)
+    _assert_student_in_scope(psicologo, student.id_estudiante, db)
 
     interventions = (
         db.query(Intervencion)
@@ -1147,11 +1424,24 @@ async def get_student_interventions(
         .order_by(Intervencion.fecha_intervencion.desc())
         .all()
     )
-    return interventions
+    return [
+        IntervencionResponse(
+            id_intervencion=i.id_intervencion,
+            id_estudiante=i.id_estudiante,
+            id_psicologo=i.id_psicologo,
+            tipo_intervencion=i.tipo_intervencion,
+            descripcion=i.descripcion,
+            fecha_intervencion=i.fecha_intervencion,
+            created_at=i.created_at,
+            updated_at=i.updated_at,
+            es_propia=psicologo is not None and i.id_psicologo == psicologo.id_psicologo,
+        )
+        for i in interventions
+    ]
 
 
 @router.post("/student-history/{anon_student_id}/interventions", response_model=IntervencionResponse, status_code=201)
-async def create_student_intervention(
+def create_student_intervention(
     anon_student_id: str,
     body: IntervencionCreate,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -1172,9 +1462,7 @@ async def create_student_intervention(
     if not student_key:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador de estudiante no válido")
 
-    student = db.query(Estudiante).filter(
-        func.lower(func.substr(cast(Estudiante.id_estudiante, String), 1, len(student_key))) == student_key
-    ).first()
+    student = _find_student_by_key(db, student_key)
 
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Estudiante no encontrado")
@@ -1210,7 +1498,7 @@ async def create_student_intervention(
 
 
 @router.put("/interventions/{intervention_id}", response_model=IntervencionResponse)
-async def update_clinical_intervention(
+def update_clinical_intervention(
     intervention_id: UUID,
     body: IntervencionUpdate,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -1254,7 +1542,7 @@ async def update_clinical_intervention(
 # --- Clinical Notification Routes (HU0029) ---
 
 @router.get("/notifications", response_model=list[NotificacionResponse])
-async def get_notifications(
+def get_notifications(
     solo_no_revisadas: bool = Query(False, description="Si es True, filtra solo notificaciones no revisadas"),
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db)
@@ -1271,6 +1559,12 @@ async def get_notifications(
         except Exception:
             pass
 
+    if current_user.get("role") == "psicologo" and psicologo is None:
+        return []
+
+    # Escalamiento de casos sin contactar a tiempo (como máximo una vez por minuto).
+    escalate_overdue_alerts(db)
+
     # Admins see all notifications; psicólogos only see their own
     query = db.query(Notificacion)
     if psicologo:
@@ -1279,36 +1573,30 @@ async def get_notifications(
     if solo_no_revisadas:
         query = query.filter(Notificacion.revisada == False)
 
-    notifs = query.order_by(Notificacion.created_at.desc()).limit(50).all()
+    # Una sola consulta: notificación -> resultado -> evaluación -> estudiante + puntaje
+    # (antes eran hasta 4 consultas por notificación).
+    scores = phq9_scores_subquery(db)
+    rows = (
+        query.outerjoin(Resultado, Resultado.id_resultado == Notificacion.id_resultado)
+        .outerjoin(Evaluacion, Evaluacion.id_evaluacion == Resultado.id_evaluacion)
+        .outerjoin(Estudiante, Estudiante.id_estudiante == Evaluacion.id_estudiante)
+        .outerjoin(scores, scores.c.id_evaluacion == Evaluacion.id_evaluacion)
+        .add_columns(
+            Evaluacion.id_evaluacion,
+            Estudiante.id_estudiante,
+            Estudiante.carrera,
+            Estudiante.universidad,
+            scores.c.puntaje,
+        )
+        .order_by(Notificacion.created_at.desc())
+        .limit(50)
+        .all()
+    )
 
     result = []
-    for n in notifs:
-        # Enrich with student data through resultado -> evaluacion -> estudiante
-        id_anonimo = None
-        carrera = None
-        universidad = None
-        puntaje = None
-        try:
-            resultado = n.resultado
-            if resultado:
-                eval_row = db.query(Evaluacion).filter(
-                    Evaluacion.id_evaluacion == resultado.id_evaluacion
-                ).first()
-                if eval_row:
-                    student = db.query(Estudiante).filter(
-                        Estudiante.id_estudiante == eval_row.id_estudiante
-                    ).first()
-                    if student:
-                        id_anonimo = f"#{student.id_estudiante.hex[:6].upper()}"
-                        carrera = student.carrera
-                        universidad = student.universidad
-                    # Calculate puntaje
-                    puntaje = db.query(func.sum(Respuesta.valor)).filter(
-                        Respuesta.id_evaluacion == eval_row.id_evaluacion
-                    ).scalar() or 0
-                    puntaje = int(puntaje)
-        except Exception:
-            pass
+    for n, id_evaluacion, id_estudiante, carrera, universidad, puntaje_sum in rows:
+        id_anonimo = f"#{id_estudiante.hex[:6].upper()}" if id_estudiante else None
+        puntaje = int(puntaje_sum or 0) if id_evaluacion else None
 
         result.append(
             NotificacionResponse(
@@ -1333,7 +1621,7 @@ async def get_notifications(
 
 
 @router.put("/notifications/{notification_id}/mark-revisada", response_model=NotificacionResponse)
-async def mark_notification_revisada(
+def mark_notification_revisada(
     notification_id: UUID,
     body: NotificacionMarkRevisada,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -1345,6 +1633,11 @@ async def mark_notification_revisada(
     notif = db.query(Notificacion).filter(Notificacion.id_notificacion == notification_id).first()
     if notif is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notificación no encontrada")
+    psicologo = _resolve_psicologo(current_user, db)
+    if is_psicologo_without_profile(current_user, psicologo) or (
+        psicologo is not None and notif.id_psicologo != psicologo.id_psicologo
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Esta notificación no es tuya.")
 
     notif.revisada = body.revisada
     notif.leida = True
@@ -1402,7 +1695,7 @@ async def mark_notification_revisada(
 # --- Chatbot Performance Monitoring (HU0016) ---
 
 @router.get("/chatbot/metrics", response_model=ChatbotMetricsResponse)
-async def get_chatbot_metrics(
+def get_chatbot_metrics(
     limit_incidencias: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
@@ -1438,7 +1731,7 @@ async def get_chatbot_metrics(
 
 
 @router.get("/chatbot/interactions", response_model=List[ChatbotInteractionResponse])
-async def list_chatbot_interactions(
+def list_chatbot_interactions(
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     resuelta: bool | None = Query(None, description="Filtra por resuelta/no resuelta"),
@@ -1464,7 +1757,7 @@ async def list_chatbot_interactions(
 # --- System Audit Log (HU0043 CA3) ---
 
 @router.get("/audit", response_model=AuditLogListResponse)
-async def get_audit_log(
+def get_audit_log(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     id_usuario: UUID | None = Query(None, description="Filtra por usuario"),
@@ -1494,15 +1787,16 @@ async def get_audit_log(
 
     total = query.count()
     rows = (
-        query.order_by(AuditoriaAcceso.fecha_evento.desc())
+        query.outerjoin(Usuario, Usuario.id_usuario == AuditoriaAcceso.id_usuario)
+        .add_entity(Usuario)
+        .order_by(AuditoriaAcceso.fecha_evento.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
 
     items: List[AuditLogResponse] = []
-    for row in rows:
-        usuario = db.query(Usuario).filter(Usuario.id_usuario == row.id_usuario).first()
+    for row, usuario in rows:
         items.append(
             AuditLogResponse(
                 id_auditoria=row.id_auditoria,
@@ -1513,7 +1807,7 @@ async def get_audit_log(
                 fecha_evento=row.fecha_evento,
                 ip_origen=row.ip_origen,
                 detalle=row.detalle,
-                usuario_email=usuario.email if usuario else None,
+                usuario_email=usuario.correo if usuario else None,
                 usuario_nombre=getattr(usuario, "nombre", None) if usuario else None,
             )
         )

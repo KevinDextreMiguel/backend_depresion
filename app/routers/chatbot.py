@@ -19,7 +19,7 @@ router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
 
 @router.get("/responses", response_model=List[ChatbotResponse])
-async def get_chatbot_responses(
+def get_chatbot_responses(
     active: bool = True,
     db: Session = Depends(get_db),
 ):
@@ -31,7 +31,7 @@ async def get_chatbot_responses(
 
 
 @router.post("/responses", response_model=ChatbotResponse, status_code=status.HTTP_201_CREATED)
-async def create_chatbot_response(
+def create_chatbot_response(
     payload: ChatbotResponseCreate,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
@@ -58,7 +58,7 @@ async def create_chatbot_response(
 
 
 @router.put("/responses/{response_id}", response_model=ChatbotResponse)
-async def update_chatbot_response(
+def update_chatbot_response(
     response_id: UUID,
     payload: ChatbotResponseUpdate,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
@@ -86,7 +86,7 @@ async def update_chatbot_response(
 
 
 @router.delete("/responses/{response_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_chatbot_response(
+def delete_chatbot_response(
     response_id: UUID,
     current_user: dict = Depends(require_role(["admin", "psicologo"])),
     db: Session = Depends(get_db),
@@ -102,7 +102,7 @@ async def delete_chatbot_response(
 
 
 @router.post("/interactions", response_model=ChatbotInteractionResponse, status_code=status.HTTP_201_CREATED)
-async def register_chatbot_interaction(
+def register_chatbot_interaction(
     payload: ChatbotInteractionCreate,
     current_user: Optional[dict] = Depends(get_current_user_optional),
     db: Session = Depends(get_db),

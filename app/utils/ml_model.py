@@ -42,6 +42,11 @@ SEED = 42
 N_OUTER = 5
 N_INNER = 5
 
+# Procesos en paralelo para GridSearchCV. Por defecto 1: con -1, joblib lanza un
+# proceso por núcleo detectado y en servidores pequeños (p. ej. Render, 512 MB)
+# puede agotar la memoria y matar el proceso a mitad del reentrenamiento.
+ML_N_JOBS = int(os.getenv("ML_N_JOBS", "1"))
+
 PRIMARY_MODEL_NAME = "LogisticRegression"
 COMPARATOR_MODEL_NAME = "RandomForest"
 
@@ -120,7 +125,7 @@ def _grid_search(spec, inner_seed):
         scoring="roc_auc",
         cv=StratifiedKFold(n_splits=N_INNER, shuffle=True, random_state=inner_seed),
         refit=True,
-        n_jobs=-1,
+        n_jobs=ML_N_JOBS,
     )
 
 
@@ -226,10 +231,14 @@ def _metrics(y_true, prob):
     }
 
 
-def train_and_compare_models(df=None, db=None):
+def train_and_compare_models(df=None, db=None, include_comparator: bool = False):
     """
-    Reproduce NB01: nested CV (OOF) para LR y RF, y despliega la Logistic Regression
+    Protocolo de NB01: nested CV (OOF) y despliegue de la Logistic Regression
     (modelo primario del paper) ajustada sobre todo el dataset con C elegido por CV.
+
+    include_comparator: si es True, también evalúa el Random Forest comparador con
+    su nested CV completo. Es solo informativo (nunca se despliega) y cuesta ~200x
+    más que la LR (450 ajustes de 500 árboles), por eso es opcional.
 
     Retorna (results: dict[nombre -> métricas], winner_name).
     `winner_name` es siempre el modelo primario: el paper no selecciona modelo por métrica.
@@ -240,9 +249,10 @@ def train_and_compare_models(df=None, db=None):
     X = df[FEATURES].astype(float)
     y = df[TARGET].astype(int)
 
+    model_names = [PRIMARY_MODEL_NAME] + ([COMPARATOR_MODEL_NAME] if include_comparator else [])
     results = {}
-    for name, spec in MODEL_SPECS.items():
-        oof = _nested_oof(spec, X, y)
+    for name in model_names:
+        oof = _nested_oof(MODEL_SPECS[name], X, y)
         results[name] = {"model_name": name, **_metrics(y, oof)}
 
     final_search = _grid_search(MODEL_SPECS[PRIMARY_MODEL_NAME], inner_seed=SEED)
@@ -260,12 +270,15 @@ def train_and_compare_models(df=None, db=None):
         "oof_metrics": results,
         "paper_dataset_sha256": DATASET_SHA256,
     }
-    joblib.dump(artifact, MODEL_PATH)
+    # Escritura atómica: las predicciones en curso nunca leen un archivo a medio escribir.
+    tmp_path = f"{MODEL_PATH}.tmp"
+    joblib.dump(artifact, tmp_path)
+    os.replace(tmp_path, MODEL_PATH)
+
+    auc_summary = " ".join(f"{name}={r['roc_auc']:.3f}" for name, r in results.items())
     print(
         f"OK: {PRIMARY_MODEL_NAME} (paper) guardado en {MODEL_PATH} | "
-        f"best={json.dumps(final_search.best_params_)} | n={len(y)} | "
-        f"OOF AUC LR={results[PRIMARY_MODEL_NAME]['roc_auc']:.3f} "
-        f"RF={results[COMPARATOR_MODEL_NAME]['roc_auc']:.3f}"
+        f"best={json.dumps(final_search.best_params_)} | n={len(y)} | OOF AUC {auc_summary}"
     )
 
     for name in results:

@@ -20,7 +20,7 @@ router = APIRouter(prefix="/admin/backups", tags=["Backup & Restore (HU0032)"])
 
 # --- GET /admin/backups/config ---
 @router.get("/config", response_model=BackupConfigResponse)
-async def get_backup_config(
+def get_backup_config(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
@@ -43,7 +43,7 @@ async def get_backup_config(
 
 # --- PUT /admin/backups/config ---
 @router.put("/config", response_model=BackupConfigResponse)
-async def update_backup_config(
+def update_backup_config(
     payload: BackupConfigUpdate,
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
@@ -108,7 +108,7 @@ async def update_backup_config(
 
 # --- GET /admin/backups ---
 @router.get("", response_model=list[BackupLogResponse])
-async def list_backups(
+def list_backups(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
@@ -126,7 +126,7 @@ async def list_backups(
 
 # --- POST /admin/backups/run ---
 @router.post("/run", response_model=BackupRunResponse, status_code=status.HTTP_201_CREATED)
-async def run_backup(
+def run_backup(
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
@@ -156,7 +156,7 @@ async def run_backup(
 
 # --- POST /admin/backups/{backup_id}/restore ---
 @router.post("/{backup_id}/restore", response_model=BackupRestoreResponse)
-async def restore_backup(
+def restore_backup(
     backup_id: UUID,
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
@@ -197,7 +197,7 @@ async def restore_backup(
 
 # --- GET /admin/backups/{backup_id}/download ---
 @router.get("/{backup_id}/download")
-async def download_backup(
+def download_backup(
     backup_id: UUID,
     current_user: dict = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),

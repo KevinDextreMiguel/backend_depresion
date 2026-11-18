@@ -254,8 +254,8 @@ class DerivacionCreate(PyModel):
     institucion_referencia: Optional[str] = None
 
 class DerivacionUpdate(BaseModel):
-    estado: Optional[str] = Field(None, description="pendiente, contactado, atendido, cerrado")
-    accion_tomada: Optional[str] = Field(None, description="Descripción de la acción tomada")
+    estado: Optional[str] = Field(None, description="pendiente, contactado, en_seguimiento, derivado_externo, cerrado")
+    accion_tomada: Optional[str] = Field(None, description="Nota de la acción realizada (obligatoria al cambiar el estado)")
     institucion_referencia: Optional[str] = Field(None, description="Institución de referencia alternativa")
 
 class DerivacionResponse(BaseModel):
@@ -264,9 +264,11 @@ class DerivacionResponse(BaseModel):
     accion: str
     institucion: Optional[str] = None
     fecha: datetime
-    estado: str = Field(..., description="pendiente, contactado, atendido, cerrado")
+    estado: str = Field(..., description="pendiente, contactado, en_seguimiento, derivado_externo, cerrado")
     nivel_riesgo: str
     alerta_suicidio: bool
+    id_anonimo: Optional[str] = None
+    puntaje: Optional[int] = None
 
 
 class ObservacionCreate(BaseModel):
@@ -285,6 +287,8 @@ class ObservacionResponse(BaseModel):
     texto: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # True si quien consulta puede editarla (autor o admin).
+    editable: Optional[bool] = None
 
 # --- Statistics & Access Auditing ---
 class RiskDistribution(BaseModel):
@@ -298,6 +302,16 @@ class StatisticsResponse(BaseModel):
     total: int
     averageScore: float
     riskDistribution: RiskDistribution
+    # Admin: estudiantes activos registrados. Psicólogo: estudiantes asignados a él.
+    totalStudents: int = 0
+    # Estudiantes (del mismo alcance) con al menos una evaluación.
+    evaluatedStudents: int = 0
+    # Casos con ítem 9 positivo cuya derivación sigue abierta.
+    activeSuicideAlerts: int = 0
+    # Casos (derivaciones) abiertos: pendiente, contactado o en seguimiento.
+    openCases: int = 0
+    # Casos pendientes de primer contacto.
+    pendingContact: int = 0
 
 class ReportItem(BaseModel):
     id_anonimo: str
@@ -320,6 +334,8 @@ class StudentHistoryItem(BaseModel):
     comentarios: Optional[str] = None
     observaciones: List[ObservacionResponse] = []
     interpretabilidad: Optional[Dict[str, Any]] = None
+    # Respuestas PHQ-9 ítem por ítem (0-3), en el orden del cuestionario.
+    respuestas_phq9: Optional[List[int]] = None
 
 
 class StudentEvolutionItem(BaseModel):
@@ -337,6 +353,15 @@ class AssignedPatientItem(BaseModel):
     puntaje: int
     alerta_suicidio: bool
     estado_evaluacion: Optional[str] = None
+    # Estado del caso (derivación) de la evaluación más reciente, si existe.
+    estado_caso: Optional[str] = None
+
+
+class AppointmentUpdate(BaseModel):
+    estado: Optional[str] = Field(None, description="programada, completada, no_asistio, cancelada")
+    fecha_inicio: Optional[datetime] = Field(None, description="Nueva fecha para reprogramar")
+    duracion_minutos: Optional[int] = None
+    descripcion: Optional[str] = None
 
 
 class AppointmentCreate(BaseModel):
@@ -355,6 +380,9 @@ class AppointmentResponse(PyModel):
     estado: str
     descripcion: Optional[str] = None
     created_at: datetime
+    # Identificador anónimo (#XXXXXX) y carrera, como en el resto del panel.
+    id_anonimo: Optional[str] = None
+    carrera: Optional[str] = None
 
 class ModelStatusResponse(BaseModel):
     model_name: str
@@ -373,6 +401,10 @@ class ModelRetrainRequest(BaseModel):
     version: Optional[str] = Field(None, description="Versión nueva del modelo")
     origen_datos: Optional[str] = Field(None, description="Fuente de los datos usados para el reentrenamiento")
     comentario: Optional[str] = Field(None, description="Comentario o descripción del reentrenamiento")
+    incluir_comparador: bool = Field(
+        False,
+        description="Si es True, evalúa también el Random Forest comparador (solo informativo; tarda varios minutos)",
+    )
 
 class ModelPerformance(BaseModel):
     model_name: str
@@ -441,6 +473,8 @@ class IntervencionResponse(PyModel):
     fecha_intervencion: datetime
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # True si la registró quien consulta.
+    es_propia: Optional[bool] = None
 
 
 # --- Clinical Notifications (HU0029) ---

@@ -221,14 +221,25 @@ async def submit_questionnaire_simple(
     # T-008: se reparte por carga (menor cantidad de evaluaciones asignadas)
     # en vez de tomar siempre el primer psicólogo activo encontrado — evita que
     # toda la cartera de "pacientes asignados" recaiga sobre un único psicólogo.
+    # Continuidad terapéutica: si el estudiante ya tiene un psicólogo activo
+    # (su evaluación más reciente), se mantiene el mismo. Solo los estudiantes
+    # nuevos se reparten por carga.
     psicologo = (
         db.query(Psicologo)
-        .filter(Psicologo.activo == True)
-        .outerjoin(Evaluacion, Evaluacion.id_psicologo == Psicologo.id_psicologo)
-        .group_by(Psicologo.id_psicologo)
-        .order_by(func.count(Evaluacion.id_evaluacion).asc())
+        .join(Evaluacion, Evaluacion.id_psicologo == Psicologo.id_psicologo)
+        .filter(Evaluacion.id_estudiante == student_id, Psicologo.activo == True)
+        .order_by(Evaluacion.fecha_evaluacion.desc())
         .first()
     )
+    if psicologo is None:
+        psicologo = (
+            db.query(Psicologo)
+            .filter(Psicologo.activo == True)
+            .outerjoin(Evaluacion, Evaluacion.id_psicologo == Psicologo.id_psicologo)
+            .group_by(Psicologo.id_psicologo)
+            .order_by(func.count(Evaluacion.id_evaluacion).asc())
+            .first()
+        )
     if not psicologo:
         # No active psicologo — try to create a system one using the student's auth user ID
         # The student's user ID IS valid in auth.users (Supabase) so no FK violation
@@ -316,6 +327,7 @@ async def submit_questionnaire_simple(
     mspss_mean = round(mspss_total / 12.0, 4)
 
     # 8. Inferencia en tiempo real con el modelo del paper (Logistic Regression, NB01)
+    ml_fallback = False
     try:
         from ..utils.ml_model import predict_depression_risk
         ml_pred, ml_prob, mspss_mean = predict_depression_risk(
@@ -326,6 +338,7 @@ async def submit_questionnaire_simple(
         print(f"[MindCheck] Inferencia ML OK: pred={ml_pred}, prob={ml_prob}", flush=True)
     except Exception as ml_err:
         print(f"[MindCheck] Inferencia fallida, aplicando fallback por reglas: {ml_err}", flush=True)
+        ml_fallback = True
         ml_pred = 1 if score >= 10 else 0
         ml_prob = float(round((score / 27.0) * 100, 2))
 
@@ -357,10 +370,11 @@ async def submit_questionnaire_simple(
             interpretabilidad={
                 "score": score,
                 "q9_value": q9_value,
-                "risk_factors": ["item_9_alert" if suicide_alert else None],
-                "tree_path": "root -> phq9_score -> " + risk_level,
+                "risk_factors": ["item_9_alert"] if suicide_alert else [],
                 "ml_prediction": "riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
+                # Porcentaje 0-100. Si ml_fallback es True, no viene del modelo sino de puntaje/27.
                 "ml_probability": ml_prob,
+                "ml_fallback": ml_fallback,
                 "horas_sueno": payload.horas_sueno,
                 "mspss_total": mspss_total,
                 "mspss_mean": mspss_mean,
@@ -390,7 +404,11 @@ async def submit_questionnaire_simple(
             id_resultado=result_id,
             id_psicologo=psicologo.id_psicologo,
             nivel_prioridad=priority,
-            accion_tomada=f"Derivación automática iniciada por tamizaje. Alerta suicidio: {suicide_alert}, Score: {score}, ML Probabilidad: {ml_prob}%",
+            accion_tomada=(
+                f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC · sistema] Derivación automática por tamizaje: "
+                f"PHQ-9 {score}/27 ({risk_level.replace('_', ' ')})"
+                + (f", ítem 9 = {q9_value}/3." if suicide_alert else ".")
+            ),
             fecha_derivacion=datetime.utcnow(),
             estado="pendiente",
             institucion_referencia="Psicología Universitaria UPC / Servicio Médico Emergencia"
@@ -401,30 +419,27 @@ async def submit_questionnaire_simple(
         db.add(db_eval)
         db.commit()
 
-        # Notificación a psicólogos activos
+        # Notificación al psicólogo asignado (responsable del caso). Si no lo
+        # contacta a tiempo, utils.clinical.escalate_overdue_alerts avisa al resto
+        # del equipo (antes se notificaba a todos y nadie quedaba como responsable).
         try:
             from ..models import Notificacion
-            titulo = "Caso Crítico Detectado" if suicide_alert else "Caso de Riesgo Alto Detectado"
+            titulo = "Ítem 9 positivo: contactar hoy" if suicide_alert else "Caso de riesgo alto asignado"
             mensaje = (
-                f"Se ha detectado un caso con riesgo {risk_level.replace('_', ' ')}. "
-                f"Puntaje PHQ-9: {score}/27. "
-                + (f"Inferencia Logistic Regression: {ml_prob}% riesgo. " if ml_pred == 1 else "")
-                + ("ALERTA DE SUICIDIO ACTIVA. " if suicide_alert else "")
-                + "Se requiere atención inmediata."
+                (f"Respuesta al ítem 9 (ideación de muerte/autolesión): {q9_value}/3. " if suicide_alert else "")
+                + f"PHQ-9: {score}/27 ({risk_level.replace('_', ' ')}). "
+                + "Abre el caso, contacta al estudiante y registra la acción realizada."
             )
-            all_psicologos = db.query(Psicologo).filter(Psicologo.activo == True).all()
-            for psico in all_psicologos:
-                notif = Notificacion(
-                    id_psicologo=psico.id_psicologo,
-                    id_resultado=result_id,
-                    titulo=titulo,
-                    mensaje=mensaje,
-                    nivel_riesgo=risk_level,
-                    alerta_suicidio=suicide_alert,
-                    leida=False,
-                    revisada=False,
-                )
-                db.add(notif)
+            db.add(Notificacion(
+                id_psicologo=psicologo.id_psicologo,
+                id_resultado=result_id,
+                titulo=titulo,
+                mensaje=mensaje,
+                nivel_riesgo=risk_level,
+                alerta_suicidio=suicide_alert,
+                leida=False,
+                revisada=False,
+            ))
             db.commit()
         except Exception as notif_err:
             db.rollback()

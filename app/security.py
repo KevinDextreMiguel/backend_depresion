@@ -1,10 +1,14 @@
 import jwt
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 from .config import settings
 from sqlalchemy import func
 from cryptography.fernet import Fernet
 import base64
+import hashlib
+import threading
+import time
 
 security_bearer = HTTPBearer()
 security_bearer_optional = HTTPBearer(auto_error=False)
@@ -104,6 +108,63 @@ def _user_from_jwt(decoded: dict) -> dict:
     }
 
 
+# Caché corta de tokens validados contra Supabase Auth. Sin ella, cada petición
+# del panel hacía una llamada HTTP a Supabase antes de tocar la base de datos.
+_SUPABASE_USER_CACHE: dict[str, tuple[float, dict]] = {}
+_SUPABASE_USER_CACHE_LOCK = threading.Lock()
+_SUPABASE_USER_CACHE_TTL = 60  # segundos
+_SUPABASE_USER_CACHE_MAX = 1000
+
+
+def _token_cache_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _cache_get_user(token: str) -> dict | None:
+    key = _token_cache_key(token)
+    now = time.time()
+    with _SUPABASE_USER_CACHE_LOCK:
+        entry = _SUPABASE_USER_CACHE.get(key)
+        if entry and entry[0] > now:
+            return entry[1]
+        if entry:
+            _SUPABASE_USER_CACHE.pop(key, None)
+    return None
+
+
+def _cache_put_user(token: str, user: dict) -> None:
+    expires_at = time.time() + _SUPABASE_USER_CACHE_TTL
+    # Nunca cachear más allá de la expiración del propio token.
+    try:
+        exp = jwt.decode(token, options={"verify_signature": False}).get("exp")
+        if exp:
+            expires_at = min(expires_at, float(exp))
+    except jwt.PyJWTError:
+        pass
+    with _SUPABASE_USER_CACHE_LOCK:
+        if len(_SUPABASE_USER_CACHE) >= _SUPABASE_USER_CACHE_MAX:
+            now = time.time()
+            for k in [k for k, (exp_at, _) in _SUPABASE_USER_CACHE.items() if exp_at <= now]:
+                _SUPABASE_USER_CACHE.pop(k, None)
+            if len(_SUPABASE_USER_CACHE) >= _SUPABASE_USER_CACHE_MAX:
+                _SUPABASE_USER_CACHE.clear()
+        _SUPABASE_USER_CACHE[_token_cache_key(token)] = (expires_at, user)
+
+
+def _verify_with_supabase(supabase, token: str) -> dict | None:
+    """Llamada HTTP bloqueante a Supabase Auth; se ejecuta en el threadpool."""
+    user_response = supabase.auth.get_user(token)
+    if user_response and user_response.user:
+        meta = user_response.user.user_metadata or {}
+        return {
+            "id": user_response.user.id,
+            "email": user_response.user.email,
+            "metadata": meta,
+            "role": meta.get("role") or user_response.user.role,
+        }
+    return None
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security_bearer),
 ) -> dict:
@@ -127,16 +188,14 @@ async def get_current_user(
     # 2. Supabase Auth (solo si está configurado y disponible)
     supabase = get_supabase_client()
     if supabase:
+        cached = _cache_get_user(token)
+        if cached is not None:
+            return cached
         try:
-            user_response = supabase.auth.get_user(token)
-            if user_response and user_response.user:
-                meta = user_response.user.user_metadata or {}
-                return {
-                    "id": user_response.user.id,
-                    "email": user_response.user.email,
-                    "metadata": meta,
-                    "role": meta.get("role") or user_response.user.role,
-                }
+            user = await run_in_threadpool(_verify_with_supabase, supabase, token)
+            if user is not None:
+                _cache_put_user(token, user)
+                return user
         except Exception as e:
             raise HTTPException(
                 status_code=401,
