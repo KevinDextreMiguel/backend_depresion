@@ -70,6 +70,15 @@ def submit_questionnaire_simple(
 
         if not auth_user_id:
             try:
+                from ..security import _verify_supabase_jwt_locally
+                local_user = _verify_supabase_jwt_locally(token)
+                if local_user is not None:
+                    auth_user_id = local_user.get("id")
+            except Exception:
+                auth_user_id = None
+
+        if not auth_user_id:
+            try:
                 from ..security import get_supabase_client, _cache_get_user, _cache_put_user, _verify_with_supabase
                 cached = _cache_get_user(token)
                 if cached is not None:

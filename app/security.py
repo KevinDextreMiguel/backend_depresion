@@ -151,6 +151,50 @@ def _cache_put_user(token: str, user: dict) -> None:
         _SUPABASE_USER_CACHE[_token_cache_key(token)] = (expires_at, user)
 
 
+_jwks_client = None
+_jwks_lock = threading.Lock()
+
+
+def _verify_supabase_jwt_locally(token: str) -> dict | None:
+    """
+    Verifica localmente un token de Supabase Auth firmado con clave asimétrica
+    (ES256/RS256) usando la clave pública del proyecto (JWKS, cacheada 1 h).
+    No hace una llamada HTTP por petición como auth.get_user(). Devuelve None si
+    el token no es de este tipo, para que se use el método de respaldo.
+    Lanza jwt.ExpiredSignatureError si el token expiró.
+    """
+    global _jwks_client
+    base = (settings.SUPABASE_URL or "").rstrip("/")
+    if not base:
+        return None
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
+        return None
+    alg = header.get("alg")
+    if alg not in ("ES256", "RS256") or not header.get("kid"):
+        return None
+    with _jwks_lock:
+        if _jwks_client is None:
+            _jwks_client = jwt.PyJWKClient(f"{base}/auth/v1/.well-known/jwks.json", cache_keys=True, lifespan=3600)
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token).key
+        decoded = jwt.decode(
+            token, signing_key, algorithms=[alg], audience="authenticated", issuer=f"{base}/auth/v1",
+        )
+    except jwt.ExpiredSignatureError:
+        raise
+    except Exception:
+        return None
+    meta = decoded.get("user_metadata") or {}
+    return {
+        "id": decoded.get("sub"),
+        "email": decoded.get("email"),
+        "metadata": meta,
+        "role": meta.get("role") or decoded.get("role"),
+    }
+
+
 def _verify_with_supabase(supabase, token: str) -> dict | None:
     """Llamada HTTP bloqueante a Supabase Auth; se ejecuta en el threadpool."""
     user_response = supabase.auth.get_user(token)
@@ -185,7 +229,15 @@ async def get_current_user(
         except jwt.InvalidTokenError:
             pass
 
-    # 2. Supabase Auth (solo si está configurado y disponible)
+    # 2. Token de Supabase Auth verificado localmente con la clave pública (JWKS)
+    try:
+        local_user = await run_in_threadpool(_verify_supabase_jwt_locally, token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="El token ha expirado")
+    if local_user is not None:
+        return local_user
+
+    # 3. Respaldo: Supabase Auth por HTTP (con caché), p. ej. tokens HS256 antiguos
     supabase = get_supabase_client()
     if supabase:
         cached = _cache_get_user(token)
