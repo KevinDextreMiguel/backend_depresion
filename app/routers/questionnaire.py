@@ -1,3 +1,5 @@
+import threading
+import time
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -21,7 +23,7 @@ class SimpleSubmitPayload(dict):
     pass
 
 @router.post("/submit-questionnaire", status_code=status.HTTP_201_CREATED)
-async def submit_questionnaire_simple(
+def submit_questionnaire_simple(
     payload: CuestionarioCompletoSubmit,
     request: Request,
     db: Session = Depends(get_db)
@@ -43,94 +45,44 @@ async def submit_questionnaire_simple(
             detail="Las respuestas MSPSS deben estar en la escala 1 a 7."
         )
 
-    # 1. Obtener o crear el cuestionario PHQ-9 por defecto
-    cuestionario = db.query(Cuestionario).filter(
-        Cuestionario.id_cuestionario == uuid.UUID('b1990c88-e25f-4a87-8d07-7ff7bd8de693')
-    ).first()
-    
-    if not cuestionario:
-        cuestionario = Cuestionario(
-            id_cuestionario=uuid.UUID('b1990c88-e25f-4a87-8d07-7ff7bd8de693'),
-            nombre="Cuestionario sobre la Salud del Paciente (PHQ-9)",
-            descripcion="Herramienta de tamizaje para detectar y medir la gravedad de la depresión.",
-            estado="activo",
-            version="1.0",
-            activo=True
-        )
-        db.add(cuestionario)
-        db.commit()
-
-    # 2. Asegurar exactamente 9 preguntas en BD
-    default_phq9 = [
-        "Poco interés o placer en hacer las cosas",
-        "Sentirse deprimido, triste o sin esperanza",
-        "Dificultad para conciliar el sueño o dormir demasiado",
-        "Sentirse cansado o con poca energía",
-        "Disminución del apetito o comer en exceso",
-        "Sentirse mal contigo mismo —o que eres un fracaso— o que has defraudado a tu familia",
-        "Dificultad para concentrarte en cosas, como leer el periódico o ver la televisión",
-        "Moverte o hablar tan lento que otras personas podrían haberlo notado, o lo contrario — estar tan inquieto que te mueves mucho más de lo habitual",
-        "Pensamientos de que estarías mejor muerto o de hacerte daño de alguna manera"
-    ]
-    existing_questions = db.query(Pregunta).filter(
-        Pregunta.id_cuestionario == cuestionario.id_cuestionario
-    ).count()
-    if existing_questions != len(default_phq9):
-        # Delete any partial/corrupted questions and recreate all
-        try:
-            db.query(Pregunta).filter(
-                Pregunta.id_cuestionario == cuestionario.id_cuestionario
-            ).delete(synchronize_session=False)
-            db.commit()
-        except Exception:
-            db.rollback()
-        for idx, txt in enumerate(default_phq9, start=1):
-            q = Pregunta(
-                id_pregunta=uuid.uuid4(),
-                id_cuestionario=cuestionario.id_cuestionario,
-                texto=txt,
-                orden=idx,
-                dimension="PHQ-9",
-                activa=True
-            )
-            db.add(q)
-        db.commit()
+    # 1-2. Cuestionario PHQ-9 y sus 9 preguntas. Se verifican (y crean si faltan)
+    # una sola vez por proceso; luego se usan los ids en memoria.
+    cuestionario_id, pregunta_ids = _ensure_phq9_questionnaire(db)
 
     # 3. Crear perfil de estudiante con datos ingresados
     # Priority: 1) Bearer token (authenticated user), 2) test_user_id from payload
     test_user_id = payload.test_user_id
     auth_user_id = None
     
-    # Try to get authenticated user from Bearer token
+    # Usuario autenticado a partir del Bearer token. Mismo orden que
+    # security.get_current_user: JWT local (sin red) y, si no, Supabase Auth con
+    # caché de 60 s (antes cada envío hacía una llamada HTTP a Supabase).
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        # Try Supabase validation first (most reliable for Supabase-issued tokens)
         try:
-            from ..security import get_supabase_client
-            supabase = get_supabase_client()
-            if supabase:
-                try:
-                    user_resp = supabase.auth.get_user(token)
-                    if user_resp and user_resp.user:
-                        auth_user_id = user_resp.user.id
-                        print(f"[MindCheck] Auth OK via Supabase: {auth_user_id}", flush=True)
-                except Exception as sup_err:
-                    print(f"[MindCheck] Supabase auth failed: {sup_err}", flush=True)
+            import jwt as pyjwt
+            from ..config import settings
+            decoded = pyjwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+            auth_user_id = decoded.get("sub")
         except Exception:
-            pass
-        
-        # Fallback: Try local JWT decode
+            auth_user_id = None
+
         if not auth_user_id:
             try:
-                import jwt as pyjwt
-                from ..config import settings
-                decoded = pyjwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-                auth_user_id = decoded.get("sub")
-                if auth_user_id:
-                    print(f"[MindCheck] Auth OK via local JWT: {auth_user_id}", flush=True)
-            except Exception as jwt_err:
-                print(f"[MindCheck] Local JWT decode failed: {jwt_err}", flush=True)
+                from ..security import get_supabase_client, _cache_get_user, _cache_put_user, _verify_with_supabase
+                cached = _cache_get_user(token)
+                if cached is not None:
+                    auth_user_id = cached.get("id")
+                else:
+                    supabase = get_supabase_client()
+                    if supabase:
+                        user = _verify_with_supabase(supabase, token)
+                        if user is not None:
+                            _cache_put_user(token, user)
+                            auth_user_id = user.get("id")
+            except Exception as sup_err:
+                print(f"[MindCheck] Supabase auth failed: {sup_err}", flush=True)
     
     try:
         if auth_user_id:
@@ -167,7 +119,7 @@ async def submit_questionnaire_simple(
                 activo=True
             )
             db.add(anon_user)
-            db.commit()
+            db.flush()
 
         # Reutilizar o crear perfil de Estudiante con los datos ingresados por el usuario
         db_student = db.query(Estudiante).filter(Estudiante.id_usuario == anon_user_id).first()
@@ -206,7 +158,7 @@ async def submit_questionnaire_simple(
             )
             db.add(db_consent)
 
-        db.commit()
+        db.flush()
     except HTTPException:
         raise
     except Exception as e:
@@ -270,57 +222,25 @@ async def submit_questionnaire_simple(
                     detail="No hay psicólogos disponibles en el sistema. Por favor contacte al administrador."
                 )
 
-    # 5. Crear Evaluacion
-    try:
-        eval_id = uuid.uuid4()
-        db_eval = Evaluacion(
-            id_evaluacion=eval_id,
-            id_estudiante=student_id,
-            id_cuestionario=cuestionario.id_cuestionario,
-            id_psicologo=psicologo.id_psicologo,
-            estado="completada",
-            consentimiento_verificado=True
-        )
-        db.add(db_eval)
-        db.commit()
-    except Exception as eval_err:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al registrar evaluación: {str(eval_err)}"
-        )
+    # 5-9. Evaluación, respuestas y resultado: se agregan a la sesión y se
+    # confirman en UN solo commit al final (antes eran 5-8 commits secuenciales;
+    # cada uno es un viaje de red a la base y dejaba datos a medias si algo fallaba).
+    eval_id = uuid.uuid4()
+    db_eval = Evaluacion(
+        id_evaluacion=eval_id,
+        id_estudiante=student_id,
+        id_cuestionario=cuestionario_id,
+        id_psicologo=psicologo.id_psicologo,
+        estado="completada",
+        consentimiento_verificado=True
+    )
+    db.add(db_eval)
 
-    # 6. Guardar respuestas del PHQ-9 en base de datos
-    print(f"[MindCheck] Paso 6: guardando respuestas PHQ-9 para evaluacion {eval_id}", flush=True)
-    questions = db.query(Pregunta).filter(
-        Pregunta.id_cuestionario == cuestionario.id_cuestionario
-    ).order_by(Pregunta.orden).all()
-    if len(questions) != 9:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno: se encontraron {len(questions)} preguntas en lugar de 9."
-        )
-
-    score = 0
-    try:
-        for idx, ans_val in enumerate(payload.phq9_respuestas):
-            score += ans_val
-            pregunta = questions[idx]
-            db_ans = Respuesta(
-                id_respuesta=uuid.uuid4(),
-                id_evaluacion=eval_id,
-                id_pregunta=pregunta.id_pregunta,
-                valor=ans_val
-            )
-            db.add(db_ans)
-        db.flush()
-    except Exception as resp_err:
-        db.rollback()
-        print(f"[MindCheck] Error guardando respuestas: {resp_err}", flush=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al guardar respuestas PHQ-9: {str(resp_err)}"
-        )
+    score = sum(payload.phq9_respuestas)
+    db.add_all([
+        Respuesta(id_respuesta=uuid.uuid4(), id_evaluacion=eval_id, id_pregunta=pregunta_id, valor=ans_val)
+        for pregunta_id, ans_val in zip(pregunta_ids, payload.phq9_respuestas)
+    ])
 
     # 7. Calcular score de MSPSS (escala 1-7): total y media de los 12 ítems
     mspss_total = sum(payload.mspss_respuestas)
@@ -335,7 +255,6 @@ async def submit_questionnaire_simple(
             calidad_sueno=payload.calidad_sueno,
             mspss_respuestas=payload.mspss_respuestas,
         )
-        print(f"[MindCheck] Inferencia ML OK: pred={ml_pred}, prob={ml_prob}", flush=True)
     except Exception as ml_err:
         print(f"[MindCheck] Inferencia fallida, aplicando fallback por reglas: {ml_err}", flush=True)
         ml_fallback = True
@@ -358,52 +277,40 @@ async def submit_questionnaire_simple(
     q9_value = payload.phq9_respuestas[8]
     suicide_alert = q9_value >= 1
 
-    # 9. Insertar resultado clínico e interpretabilidad de ML
-    print(f"[MindCheck] Paso 9: guardando resultado. score={score}, riesgo={risk_level}", flush=True)
-    try:
-        result_id = uuid.uuid4()
-        db_result = Resultado(
-            id_resultado=result_id,
-            id_evaluacion=eval_id,
-            nivel_riesgo=risk_level,
-            probabilidad=float(round(ml_prob, 2)),
-            interpretabilidad={
-                "score": score,
-                "q9_value": q9_value,
-                "risk_factors": ["item_9_alert"] if suicide_alert else [],
-                "ml_prediction": "riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
-                # Porcentaje 0-100. Si ml_fallback es True, no viene del modelo sino de puntaje/27.
-                "ml_probability": ml_prob,
-                "ml_fallback": ml_fallback,
-                "horas_sueno": payload.horas_sueno,
-                "mspss_total": mspss_total,
-                "mspss_mean": mspss_mean,
-                "calidad_sueno": payload.calidad_sueno,
-                "historia_salud_mental": payload.historia_salud_mental
-            },
-            alerta_suicidio=suicide_alert
-        )
-        db.add(db_result)
-        db.commit()
-        print(f"[MindCheck] Resultado guardado OK: {result_id}", flush=True)
-    except Exception as res_err:
-        db.rollback()
-        print(f"[MindCheck] Error guardando resultado: {res_err}", flush=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al guardar resultado clínico: {str(res_err)}"
-        )
+    # 9. Resultado clínico e interpretabilidad de ML
+    result_id = uuid.uuid4()
+    interpretabilidad = {
+        "score": score,
+        "q9_value": q9_value,
+        "risk_factors": ["item_9_alert"] if suicide_alert else [],
+        "ml_prediction": "riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
+        # Porcentaje 0-100. Si ml_fallback es True, no viene del modelo sino de puntaje/27.
+        "ml_probability": ml_prob,
+        "ml_fallback": ml_fallback,
+        "horas_sueno": payload.horas_sueno,
+        "mspss_total": mspss_total,
+        "mspss_mean": mspss_mean,
+        "calidad_sueno": payload.calidad_sueno,
+        "historia_salud_mental": payload.historia_salud_mental
+    }
+    db.add(Resultado(
+        id_resultado=result_id,
+        id_evaluacion=eval_id,
+        nivel_riesgo=risk_level,
+        probabilidad=float(round(ml_prob, 2)),
+        interpretabilidad=interpretabilidad,
+        alerta_suicidio=suicide_alert
+    ))
 
-
-    # 10. Derivación automática si se requiere
-    if suicide_alert or risk_level in ["moderadamente_severo", "severo"]:
-        deriv_id = uuid.uuid4()
-        priority = "urgente" if suicide_alert else "alto"
-        db_deriv = DerivacionClinica(
+    # 10. Derivación automática si se requiere (forma parte del registro clínico)
+    needs_derivation = suicide_alert or risk_level in ["moderadamente_severo", "severo"]
+    deriv_id = uuid.uuid4()
+    if needs_derivation:
+        db.add(DerivacionClinica(
             id_derivacion=deriv_id,
             id_resultado=result_id,
             id_psicologo=psicologo.id_psicologo,
-            nivel_prioridad=priority,
+            nivel_prioridad="urgente" if suicide_alert else "alto",
             accion_tomada=(
                 f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC · sistema] Derivación automática por tamizaje: "
                 f"PHQ-9 {score}/27 ({risk_level.replace('_', ' ')})"
@@ -412,121 +319,107 @@ async def submit_questionnaire_simple(
             fecha_derivacion=datetime.utcnow(),
             estado="pendiente",
             institucion_referencia="Psicología Universitaria UPC / Servicio Médico Emergencia"
-        )
-        db.add(db_deriv)
-        
+        ))
         db_eval.estado = "derivada"
-        db.add(db_eval)
-        db.commit()
 
-        # Notificación al psicólogo asignado (responsable del caso). Si no lo
-        # contacta a tiempo, utils.clinical.escalate_overdue_alerts avisa al resto
-        # del equipo (antes se notificaba a todos y nadie quedaba como responsable).
-        try:
-            from ..models import Notificacion
-            titulo = "Ítem 9 positivo: contactar hoy" if suicide_alert else "Caso de riesgo alto asignado"
-            mensaje = (
-                (f"Respuesta al ítem 9 (ideación de muerte/autolesión): {q9_value}/3. " if suicide_alert else "")
-                + f"PHQ-9: {score}/27 ({risk_level.replace('_', ' ')}). "
-                + "Abre el caso, contacta al estudiante y registra la acción realizada."
-            )
-            db.add(Notificacion(
-                id_psicologo=psicologo.id_psicologo,
-                id_resultado=result_id,
-                titulo=titulo,
-                mensaje=mensaje,
-                nivel_riesgo=risk_level,
-                alerta_suicidio=suicide_alert,
-                leida=False,
-                revisada=False,
+    try:
+        db.flush()  # registro clínico obligatorio; si falla, no se guarda nada
+    except Exception as core_err:
+        db.rollback()
+        print(f"[MindCheck] Error guardando la evaluación: {core_err}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al registrar la evaluación: {str(core_err)}"
+        )
+
+    # 10b-12. Registros complementarios (notificación, auditorías, fila para el
+    # modelo) en un punto de guardado: si fallan, no impiden guardar la evaluación.
+    model_ver_str, origin_model = _active_model_labels(db)
+    try:
+        with db.begin_nested():
+            if needs_derivation:
+                # Notificación al psicólogo asignado (responsable del caso). Si no lo
+                # contacta a tiempo, utils.clinical.escalate_overdue_alerts avisa al resto.
+                from ..models import Notificacion, AuditoriaAcceso
+                db.add(Notificacion(
+                    id_psicologo=psicologo.id_psicologo,
+                    id_resultado=result_id,
+                    titulo="Ítem 9 positivo: contactar hoy" if suicide_alert else "Caso de riesgo alto asignado",
+                    mensaje=(
+                        (f"Respuesta al ítem 9 (ideación de muerte/autolesión): {q9_value}/3. " if suicide_alert else "")
+                        + f"PHQ-9: {score}/27 ({risk_level.replace('_', ' ')}). "
+                        + "Abre el caso, contacta al estudiante y registra la acción realizada."
+                    ),
+                    nivel_riesgo=risk_level,
+                    alerta_suicidio=suicide_alert,
+                    leida=False,
+                    revisada=False,
+                ))
+                db.add(AuditoriaAcceso(
+                    id_usuario=getattr(psicologo, "id_usuario", None),
+                    accion="activacion_protocolo_suicida",
+                    tabla_objetivo="derivacion_clinica",
+                    id_objetivo=deriv_id,
+                    ip_origen=client_ip,
+                    detalle=f"Protocolo activado automáticamente. Alerta suicidio: {suicide_alert}, score: {score}, ML: {ml_prob}%"
+                ))
+
+            # 11. Auditoría de inferencia ML
+            db.add(AuditoriaModelML(
+                tipo_evento="prediccion",
+                id_usuario=None,  # Anónimo
+                model_version=model_ver_str,
+                id_prediccion=result_id,
+                resultado_prediccion="riesgo_depresion" if ml_pred == 1 else "sin_riesgo"
             ))
-            db.commit()
-        except Exception as notif_err:
-            db.rollback()
-            print(f"[MindCheck] Error creando notificación: {notif_err}")
 
-        # Auditoría de acceso
-        try:
-            from ..models import AuditoriaAcceso
-            psico_user_id = psicologo.id_usuario if hasattr(psicologo, 'id_usuario') else None
-            auditoria = AuditoriaAcceso(
-                id_usuario=psico_user_id,
-                accion="activacion_protocolo_suicida",
-                tabla_objetivo="derivacion_clinica",
-                id_objetivo=deriv_id,
-                ip_origen=client_ip,
-                detalle=f"Protocolo activado automáticamente. Alerta suicidio: {suicide_alert}, score: {score}, ML: {ml_prob}%"
-            )
-            db.add(auditoria)
-            db.commit()
-        except Exception:
-            db.rollback()
+            # 12. Vista seudonimizada para análisis y reentrenamiento
+            salt = "mindcheck-salt-2026"
+            student_hash = hashlib.sha256(f"{student_id.hex}-{salt}".encode()).hexdigest()
+            edad = db_student.edad or 0
+            carrera = db_student.carrera or ""
+            rango_edad = "18-20" if edad <= 20 else "21-25" if edad <= 25 else "25+"
+            carrera_area = "Ingenierías" if "Ingeniería" in carrera else "Ciencias de la Salud" if carrera in ["Medicina", "Psicología"] else "Humanidades y Negocios"
+            db.add(VistaSeudonimizadaML(
+                id_registro=uuid.uuid4(),
+                id_evaluacion=eval_id,
+                id_estudiante=student_id,
+                id_estudiante_hash=student_hash,
+                rango_edad=rango_edad,
+                genero=db_student.genero,
+                carrera_area=carrera_area,
+                universidad=db_student.universidad,
+                q1=payload.phq9_respuestas[0],
+                q2=payload.phq9_respuestas[1],
+                q3=payload.phq9_respuestas[2],
+                q4=payload.phq9_respuestas[3],
+                q5=payload.phq9_respuestas[4],
+                q6=payload.phq9_respuestas[5],
+                q7=payload.phq9_respuestas[6],
+                q8=payload.phq9_respuestas[7],
+                q9=payload.phq9_respuestas[8],
+                prediction="riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
+                origen_modelo=origin_model,
+                note=f"Inferencia en tiempo real (LR paper). Probabilidad: {ml_prob}%.",
+                horas_sueno=payload.horas_sueno,
+                calidad_sueno=payload.calidad_sueno,
+                historia_salud_mental=payload.historia_salud_mental,
+                mspss_total=mspss_total,
+                promedio_ponderado=payload.promedio_ponderado,
+                ciclo=payload.ciclo,
+                edad=payload.edad
+            ))
+    except Exception as extra_err:
+        print(f"[MindCheck] Advertencia: registros complementarios no guardados: {extra_err}", flush=True)
 
-    # 11. Auditoría de Inferencia ML en AuditoriaModelML
     try:
-        current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
-        model_ver_str = f"{current_model.nombre} v{current_model.version}" if current_model else "LogisticRegression v1.0"
-        
-        audit_pred = AuditoriaModelML(
-            tipo_evento="prediccion",
-            id_usuario=None, # Anónimo
-            model_version=model_ver_str,
-            id_prediccion=result_id,
-            resultado_prediccion="riesgo_depresion" if ml_pred == 1 else "sin_riesgo"
-        )
-        db.add(audit_pred)
         db.commit()
-    except Exception as audit_ml_err:
+    except Exception as commit_err:
         db.rollback()
-        print(f"[MindCheck] Error en auditoría ML: {audit_ml_err}")
-
-    # 12. Insertar en Vista Seudonimizada ML con todas las variables recolectadas
-    try:
-        salt = "mindcheck-salt-2026"
-        student_hash = hashlib.sha256(f"{student_id.hex}-{salt}".encode()).hexdigest()
-        
-        rango_edad = "18-20" if db_student.edad <= 20 else "21-25" if db_student.edad <= 25 else "25+"
-        carrera_area = "Ingenierías" if "Ingeniería" in db_student.carrera else "Ciencias de la Salud" if db_student.carrera in ["Medicina", "Psicología"] else "Humanidades y Negocios"
-        
-        current_model = db.query(ModeloVersion).filter(ModeloVersion.activo == True).order_by(ModeloVersion.fecha_publicacion.desc()).first()
-        # El prefijo "LogisticRegression" marca registros con MSPSS 1-7 (reutilizables para reentrenar).
-        from ..utils.ml_model import PRIMARY_MODEL_NAME
-        origin_model = f"{PRIMARY_MODEL_NAME} v{current_model.version}" if current_model else f"{PRIMARY_MODEL_NAME} v1.0"
-
-        db_ml = VistaSeudonimizadaML(
-            id_registro=uuid.uuid4(),
-            id_evaluacion=eval_id,
-            id_estudiante=student_id,
-            id_estudiante_hash=student_hash,
-            rango_edad=rango_edad,
-            genero=db_student.genero,
-            carrera_area=carrera_area,
-            universidad=db_student.universidad,
-            q1=payload.phq9_respuestas[0],
-            q2=payload.phq9_respuestas[1],
-            q3=payload.phq9_respuestas[2],
-            q4=payload.phq9_respuestas[3],
-            q5=payload.phq9_respuestas[4],
-            q6=payload.phq9_respuestas[5],
-            q7=payload.phq9_respuestas[6],
-            q8=payload.phq9_respuestas[7],
-            q9=payload.phq9_respuestas[8],
-            prediction="riesgo_depresion" if ml_pred == 1 else "sin_riesgo",
-            origen_modelo=origin_model,
-            note=f"Inferencia en tiempo real (LR paper). Probabilidad: {ml_prob}%.",
-            horas_sueno=payload.horas_sueno,
-            calidad_sueno=payload.calidad_sueno,
-            historia_salud_mental=payload.historia_salud_mental,
-            mspss_total=mspss_total,
-            promedio_ponderado=payload.promedio_ponderado,
-            ciclo=payload.ciclo,
-            edad=payload.edad
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al confirmar la evaluación: {str(commit_err)}"
         )
-        db.add(db_ml)
-        db.commit()
-    except Exception as ml_view_err:
-        db.rollback()
-        print(f"[MindCheck] Advertencia: No se pudo insertar en vista_seudonimizada_ml: {ml_view_err}")
 
     return {
         "success": True,
@@ -534,8 +427,91 @@ async def submit_questionnaire_simple(
         "score": score,
         "nivel_riesgo": risk_level,
         "alerta_suicidio": suicide_alert,
-        "interpretabilidad": db_result.interpretabilidad
+        "interpretabilidad": interpretabilidad
     }
+
+
+# --- Cachés de datos estáticos del envío -------------------------------------
+PHQ9_QUESTIONNAIRE_ID = uuid.UUID('b1990c88-e25f-4a87-8d07-7ff7bd8de693')
+DEFAULT_PHQ9 = [
+    "Poco interés o placer en hacer las cosas",
+    "Sentirse deprimido, triste o sin esperanza",
+    "Dificultad para conciliar el sueño o dormir demasiado",
+    "Sentirse cansado o con poca energía",
+    "Disminución del apetito o comer en exceso",
+    "Sentirse mal contigo mismo —o que eres un fracaso— o que has defraudado a tu familia",
+    "Dificultad para concentrarte en cosas, como leer el periódico o ver la televisión",
+    "Moverte o hablar tan lento que otras personas podrían haberlo notado, o lo contrario — estar tan inquieto que te mueves mucho más de lo habitual",
+    "Pensamientos de que estarías mejor muerto o de hacerte daño de alguna manera"
+]
+_phq9_cache: dict = {}
+_phq9_lock = threading.Lock()
+_model_label_cache: dict = {"expires": 0.0, "value": None}
+
+
+def _ensure_phq9_questionnaire(db: Session):
+    """(id_cuestionario, [id_pregunta x9 en orden]). Crea lo que falte la primera vez."""
+    cached = _phq9_cache.get("value")
+    if cached:
+        return cached
+    with _phq9_lock:
+        if _phq9_cache.get("value"):
+            return _phq9_cache["value"]
+        cuestionario = db.query(Cuestionario).filter(Cuestionario.id_cuestionario == PHQ9_QUESTIONNAIRE_ID).first()
+        if not cuestionario:
+            db.add(Cuestionario(
+                id_cuestionario=PHQ9_QUESTIONNAIRE_ID,
+                nombre="Cuestionario sobre la Salud del Paciente (PHQ-9)",
+                descripcion="Herramienta de tamizaje para detectar y medir la gravedad de la depresión.",
+                estado="activo",
+                version="1.0",
+                activo=True
+            ))
+            db.commit()
+        preguntas = (
+            db.query(Pregunta.id_pregunta)
+            .filter(Pregunta.id_cuestionario == PHQ9_QUESTIONNAIRE_ID)
+            .order_by(Pregunta.orden)
+            .all()
+        )
+        if len(preguntas) != len(DEFAULT_PHQ9):
+            # Recrear las preguntas si están incompletas o corruptas
+            try:
+                db.query(Pregunta).filter(Pregunta.id_cuestionario == PHQ9_QUESTIONNAIRE_ID).delete(synchronize_session=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+            ids = []
+            for idx, txt in enumerate(DEFAULT_PHQ9, start=1):
+                pid = uuid.uuid4()
+                ids.append(pid)
+                db.add(Pregunta(id_pregunta=pid, id_cuestionario=PHQ9_QUESTIONNAIRE_ID, texto=txt, orden=idx, dimension="PHQ-9", activa=True))
+            db.commit()
+        else:
+            ids = [p.id_pregunta for p in preguntas]
+        _phq9_cache["value"] = (PHQ9_QUESTIONNAIRE_ID, ids)
+        return _phq9_cache["value"]
+
+
+def _active_model_labels(db: Session):
+    """(model_version para auditoría, origen_modelo para la vista ML), cacheado 60 s."""
+    now = time.time()
+    if _model_label_cache["value"] and _model_label_cache["expires"] > now:
+        return _model_label_cache["value"]
+    from ..utils.ml_model import PRIMARY_MODEL_NAME
+    current_model = (
+        db.query(ModeloVersion.nombre, ModeloVersion.version)
+        .filter(ModeloVersion.activo == True)
+        .order_by(ModeloVersion.fecha_publicacion.desc())
+        .first()
+    )
+    value = (
+        f"{current_model.nombre} v{current_model.version}" if current_model else "LogisticRegression v1.0",
+        # El prefijo "LogisticRegression" marca registros con MSPSS 1-7 (reutilizables para reentrenar).
+        f"{PRIMARY_MODEL_NAME} v{current_model.version}" if current_model else f"{PRIMARY_MODEL_NAME} v1.0",
+    )
+    _model_label_cache.update(value=value, expires=now + 60)
+    return value
 
 
 # ============================================================================
@@ -568,7 +544,7 @@ def _assert_progress_access(progress: ProgresoCuestionario, current_user: Option
 
 
 @router.post("/progress/save")
-async def save_progress(
+def save_progress(
     payload: ProgresoCreate,
     db: Session = Depends(get_db),
     current_user: Optional[dict] = Depends(get_current_user_optional),
@@ -637,7 +613,7 @@ async def save_progress(
 
 
 @router.get("/progress/recover/{session_id}")
-async def recover_progress(
+def recover_progress(
     session_id: str,
     db: Session = Depends(get_db),
     current_user: Optional[dict] = Depends(get_current_user_optional),
@@ -660,7 +636,7 @@ async def recover_progress(
 
 
 @router.delete("/progress/delete", status_code=status.HTTP_200_OK)
-async def delete_progress(
+def delete_progress(
     payload: ProgresoDeleteRequest,
     db: Session = Depends(get_db),
     current_user: Optional[dict] = Depends(get_current_user_optional),
@@ -686,7 +662,7 @@ async def delete_progress(
 
 
 @router.post("/progress/update", response_model=ProgresoResponse, status_code=status.HTTP_200_OK)
-async def update_progress(
+def update_progress(
     session_id: str,
     payload: ProgresoUpdate,
     db: Session = Depends(get_db),

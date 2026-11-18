@@ -13,7 +13,7 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/login", response_model=AuthTokenResponse)
-async def login(credentials: UserLogin, db: Session = Depends(get_db)):
+def login(credentials: UserLogin, db: Session = Depends(get_db)):
     """Inicio de sesión con Supabase Auth."""
     # Use anon client for sign_in_with_password (requires publishable/anon key)
     anon_client = get_supabase_anon_client()
@@ -84,7 +84,7 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
 
 
 @router.post("/forgot-password", status_code=status.HTTP_200_OK)
-async def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
     """Solicitar recuperación de contraseña (HU0003)."""
     # 1. Verificar si el correo existe localmente
     usuario = db.query(Usuario).filter(Usuario.correo == request.email).first()
@@ -116,7 +116,7 @@ async def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(
 
 
 @router.post("/reset-password", status_code=status.HTTP_200_OK)
-async def reset_password(request: ResetPasswordRequest):
+def reset_password(request: ResetPasswordRequest):
     """Actualizar contraseña tras hacer clic en enlace de recuperación (HU0003)."""
     supabase_client = get_supabase_client()
     if not supabase_client:
@@ -155,7 +155,7 @@ async def reset_password(request: ResetPasswordRequest):
 
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
-async def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
+def signup(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
     """Registro usando Supabase Auth admin.create_user (auto-confirma email)."""
     # T-003: el autoregistro público solo puede crear cuentas de estudiante.
     # Un rol privilegiado (admin/psicologo) requiere el código de
@@ -292,7 +292,7 @@ async def signup(user_in: UserCreate, request: Request, db: Session = Depends(ge
 
 
 @router.get("/profile", response_model=UserResponse)
-async def get_profile(
+def get_profile(
     current_user: dict = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
@@ -315,7 +315,7 @@ async def get_profile(
 
 
 @router.put("/profile", response_model=UserResponse)
-async def update_profile(
+def update_profile(
     profile_data: UserUpdateProfile,
     current_user: dict = Depends(get_current_user), 
     db: Session = Depends(get_db)
@@ -364,7 +364,7 @@ async def update_profile(
 
 
 @router.post("/signup-student", response_model=AuthTokenResponse, status_code=status.HTTP_201_CREATED)
-async def signup_student(
+def signup_student(
     student_in: StudentSignup, 
     request: Request, 
     db: Session = Depends(get_db)

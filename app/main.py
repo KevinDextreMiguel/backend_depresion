@@ -244,10 +244,15 @@ async def compatibility_submit_questionnaire(
     `/make-server-d427d5bf/submit-questionnaire` directly to our FastAPI DB handler.
     """
     from .routers.questionnaire import submit_questionnaire_simple
+    from .schemas import CuestionarioCompletoSubmit
     # If request is None, create a dummy request object
     if request is None:
         request = type('DummyRequest', (), {'headers': {}, 'client': None})()
-    return await submit_questionnaire_simple(payload, request, db)
+    try:
+        body = CuestionarioCompletoSubmit(**payload)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Cuestionario inválido: {exc}")
+    return await run_in_threadpool(submit_questionnaire_simple, body, request, db)
 
 
 @app.post("/make-server-d427d5bf/login", include_in_schema=False)
@@ -255,7 +260,7 @@ async def compatibility_login(payload: Dict[str, Any] = Body(...), db: Session =
     from .routers.auth import login
     from .schemas import UserLogin
 
-    response = await login(
+    response = await run_in_threadpool(login, 
         UserLogin(email=payload.get("email"), password=payload.get("password")),
         db,
     )
@@ -284,7 +289,7 @@ async def compatibility_login_student(payload: Dict[str, Any] = Body(...), db: S
     from .routers.auth import login
     from .schemas import UserLogin
 
-    response = await login(
+    response = await run_in_threadpool(login, 
         UserLogin(email=payload.get("email"), password=payload.get("password")),
         db,
     )
@@ -341,7 +346,7 @@ async def compatibility_signup_student(
             detail=f"Datos inválidos: {str(ve)}"
         )
 
-    result = await signup_student(student_in, request, db)
+    result = await run_in_threadpool(signup_student, student_in, request, db)
     # result is an AuthTokenResponse — map to the AuthSession shape the frontend expects
     return {
         "access_token": result.access_token,
@@ -389,10 +394,10 @@ async def compatibility_signup(
         admin_invite_code=payload.get("admin_invite_code"),
     )
     # Execute signup (requiere ADMIN_SIGNUP_CODE válido — ver T-003 en auth.py::signup)
-    await signup(user_in, request, db)
+    await run_in_threadpool(signup, user_in, request, db)
     
     # After signup, login to return the token
-    response = await login(
+    response = await run_in_threadpool(login, 
         UserLogin(email=email, password=password),
         db,
     )
