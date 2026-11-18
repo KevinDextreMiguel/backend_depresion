@@ -174,19 +174,44 @@ _cors_origins = list(set(_cors_origins_from_env + _always_allowed))
 # Errores no controlados -> JSON 500 legible. Se registra ANTES que CORSMiddleware
 # para quedar dentro de él: así la respuesta de error lleva cabeceras CORS. Sin
 # esto, el navegador bloquea el 500 y el frontend solo ve "Failed to fetch".
-@app.middleware("http")
-async def _unhandled_errors_as_json(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception as exc:
-        import traceback
-        from fastapi.responses import JSONResponse
+# Middleware ASGI puro (más liviano que BaseHTTPMiddleware / @app.middleware).
+class _UnhandledErrorsAsJSON:
+    def __init__(self, app):
+        self.app = app
 
-        traceback.print_exc()
-        detail = f"Error interno del servidor ({type(exc).__name__})"
-        if settings.DEBUG:
-            detail += f": {exc}"
-        return JSONResponse(status_code=500, content={"detail": detail})
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        response_started = False
+
+        async def send_wrapper(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as exc:
+            if response_started:
+                raise
+            import traceback
+            from fastapi.responses import JSONResponse
+
+            traceback.print_exc()
+            detail = f"Error interno del servidor ({type(exc).__name__})"
+            if settings.DEBUG:
+                detail += f": {exc}"
+            await JSONResponse(status_code=500, content={"detail": detail})(scope, receive, send)
+
+
+app.add_middleware(_UnhandledErrorsAsJSON)
+
+# Sin log de acceso por petición: en el plan gratuito de Render (0,15 CPU) escribir
+# una línea por request consume CPU. Los errores se siguen registrando.
+import logging as _logging  # noqa: E402
+
+_logging.getLogger("uvicorn.access").disabled = True
 
 
 app.add_middleware(

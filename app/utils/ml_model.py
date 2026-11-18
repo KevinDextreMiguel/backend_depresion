@@ -331,15 +331,56 @@ def predict_depression_risk(horas_sueno: float, calidad_sueno: str, mspss_respue
         raise ValueError("MSPSS debe tener 12 respuestas en escala 1-7.")
 
     artifact = load_trained_model()
-    pipeline = artifact["pipeline"]
     threshold = artifact.get("decision_threshold", DECISION_THRESHOLD)
+    x = np.array([
+        float(horas_sueno) if horas_sueno is not None else np.nan,
+        sleep_quality,
+        mspss_mean,
+    ], dtype=float)
 
-    X = pd.DataFrame([{
-        "sleep_hours": float(horas_sueno) if horas_sueno is not None else np.nan,
-        "sleep_quality": sleep_quality,
-        "mspss_mean": mspss_mean,
-    }], columns=FEATURES)
-
-    prob = float(pipeline.predict_proba(X)[0, 1])
+    prob = _fast_predict_proba(artifact, x)
     prediction = int(prob >= threshold)
     return prediction, round(prob * 100, 2), round(mspss_mean, 4)
+
+
+_fast_params_cache: dict = {}
+
+
+def _fast_predict_proba(artifact, x: np.ndarray) -> float:
+    """
+    P(PHQ-9 >= 10) calculada directamente con los parámetros del pipeline
+    (imputación por mediana -> StandardScaler -> regresión logística). Da el mismo
+    resultado que pipeline.predict_proba sin crear un DataFrame ni recorrer
+    scikit-learn: en un servidor con 0,15 CPU esto reduce el costo de cada envío.
+    Si el pipeline no tiene la forma esperada, usa scikit-learn.
+    """
+    key = id(artifact)
+    params = _fast_params_cache.get(key)
+    if params is None:
+        pipeline = artifact["pipeline"]
+        try:
+            imputer = pipeline.named_steps["imputer"]
+            scaler = pipeline.named_steps["scaler"]
+            clf = pipeline.named_steps["classifier"]
+            params = (
+                np.asarray(imputer.statistics_, dtype=float),
+                np.asarray(scaler.mean_, dtype=float),
+                np.asarray(scaler.scale_, dtype=float),
+                np.asarray(clf.coef_[0], dtype=float),
+                float(clf.intercept_[0]),
+                int(list(clf.classes_).index(1)),
+            )
+        except (KeyError, AttributeError, ValueError):
+            params = False
+        _fast_params_cache.clear()
+        _fast_params_cache[key] = params
+
+    if params is False:
+        X = pd.DataFrame([x], columns=FEATURES)
+        return float(artifact["pipeline"].predict_proba(X)[0, 1])
+
+    medians, mean, scale, coef, intercept, pos_index = params
+    x = np.where(np.isnan(x), medians, x)
+    z = float(np.dot((x - mean) / scale, coef) + intercept)
+    p1 = 1.0 / (1.0 + np.exp(-z))
+    return float(p1 if pos_index == 1 else 1.0 - p1)

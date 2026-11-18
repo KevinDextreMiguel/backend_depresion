@@ -731,6 +731,75 @@ def get_anonymized_dataset(
 # HU0041: LIVE USAGE MONITORING AND ANOMALOUS USAGE ALERTS
 # ============================================================================
 
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _read_kv(path: str) -> dict:
+    content = _read_text(path)
+    out = {}
+    for line in (content or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                out[parts[0].rstrip(":")] = int(parts[1])
+            except ValueError:
+                pass
+    return out
+
+
+@router.get("/monitoring/process")
+def get_process_metrics(current_user: dict = Depends(require_role(["admin"]))):
+    """
+    Contadores crudos de recursos del proceso del servidor, para muestrear durante
+    pruebas de carga (el plan gratuito de Render no expone CPU ni memoria).
+    El cliente calcula el % de CPU con la diferencia entre dos muestras:
+    cpu_pct = Δcpu_process_seconds / Δwall_seconds / cpu_limit_cores.
+    """
+    import os
+    import time as _time
+
+    sample = {
+        "wall_seconds": _time.time(),
+        "cpu_process_seconds": _time.process_time(),
+        "pid": os.getpid(),
+    }
+    status_kv = _read_kv("/proc/self/status")
+    if "VmRSS" in status_kv:
+        sample["rss_bytes"] = status_kv["VmRSS"] * 1024  # en kB
+
+    # Contenedor (cgroup v2, y v1 como respaldo)
+    cpu_stat = _read_kv("/sys/fs/cgroup/cpu.stat")
+    if cpu_stat:
+        sample["cgroup"] = {
+            "version": 2,
+            "cpu_usage_seconds": cpu_stat.get("usage_usec", 0) / 1e6,
+            "nr_periods": cpu_stat.get("nr_periods"),
+            "nr_throttled": cpu_stat.get("nr_throttled"),
+            "throttled_seconds": cpu_stat.get("throttled_usec", 0) / 1e6,
+            "memory_bytes": int(_read_text("/sys/fs/cgroup/memory.current") or 0) or None,
+            "memory_max": _read_text("/sys/fs/cgroup/memory.max"),
+            "cpu_max": _read_text("/sys/fs/cgroup/cpu.max"),
+        }
+    else:
+        v1 = _read_kv("/sys/fs/cgroup/cpu/cpu.stat") or _read_kv("/sys/fs/cgroup/cpu,cpuacct/cpu.stat")
+        usage = _read_text("/sys/fs/cgroup/cpuacct/cpuacct.usage") or _read_text("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage")
+        if v1 or usage:
+            sample["cgroup"] = {
+                "version": 1,
+                "cpu_usage_seconds": int(usage) / 1e9 if usage else None,
+                "nr_periods": v1.get("nr_periods"),
+                "nr_throttled": v1.get("nr_throttled"),
+                "throttled_seconds": v1.get("throttled_time", 0) / 1e9,
+                "memory_bytes": int(_read_text("/sys/fs/cgroup/memory/memory.usage_in_bytes") or 0) or None,
+            }
+    return sample
+
+
 @router.get("/monitoring/live", response_model=LiveMonitoringItem)
 def get_live_monitoring(
     current_user: dict = Depends(require_role(["admin"])),
